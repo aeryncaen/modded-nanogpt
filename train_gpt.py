@@ -1125,12 +1125,17 @@ class GPT(nn.Module):
         self.x0_lambdas.label = 'x0_lambdas'
 
         pad = (-num_layers * 3 - 3) % dist.get_world_size()  # updated: 3*num_layers instead of 4*
+        bigram_layers_ratio = min(1.0, max(0.0, float(args.geo_bigram_layers_ratio)))
+        bigram_layers = max(1, min(num_layers, int(round(bigram_layers_ratio * num_layers))))
+        bigram_lambda_init = float(args.geo_bigram_lambda_init)
+        bigram_lambdas_init = torch.zeros(num_layers)
+        bigram_lambdas_init[:bigram_layers] = bigram_lambda_init
         self.scalars = nn.Parameter(
             torch.cat(
                 [
                     1.1 * torch.ones(num_layers),  # resid lambdas. 1.1 init such that layer i weight is i^(num_layers-i).
                     *[torch.tensor([0.5, 1.0]) for _ in range(num_layers)],  # SA lambdas
-                    0.1 * torch.ones(num_layers), # bigram lambdas
+                    bigram_lambdas_init, # bigram lambdas
                     torch.zeros(1), # smear_lambda
                     0.5*torch.ones(1), # backout_lambda
                     -1.5 * torch.ones(1),  # skip_lambda -> σ(-1.5) ≈ 0.18
@@ -1769,7 +1774,7 @@ class Hyperparameters:
     geo_prebias_enable: bool = _env_bool("GEO_PREBIAS_ENABLE", False)
     geo_prebias_method: str = os.environ.get("GEO_PREBIAS_METHOD", "kl_bucket")
     geo_prebias_mtp_weights: str = os.environ.get("GEO_PREBIAS_MTP_WEIGHTS", "1.0,0.5,0.25")
-    geo_prebias_blend: float = _env_float("GEO_PREBIAS_BLEND", 0.8)
+    geo_prebias_blend: float = _env_float("GEO_PREBIAS_BLEND", 0.75)
     geo_prebias_max_tokens: int = _env_int("GEO_PREBIAS_MAX_TOKENS", 50_000_000)
     geo_prebias_chunk_tokens: int = _env_int("GEO_PREBIAS_CHUNK_TOKENS", 5_000_000)
     geo_prebias_cache_dir: str = os.environ.get("GEO_PREBIAS_CACHE_DIR", os.path.join(data_path, "cache", "geo_prebias"))
@@ -1778,8 +1783,10 @@ class Hyperparameters:
     geo_prebias_embed_lr_scale_init: float = _env_float("GEO_PREBIAS_EMBED_LR_SCALE_INIT", 1.0)
     geo_prebias_embed_lr_hold_steps: int = _env_int("GEO_PREBIAS_EMBED_LR_HOLD_STEPS", 0)
     geo_prebias_embed_lr_ramp_steps: int = _env_int("GEO_PREBIAS_EMBED_LR_RAMP_STEPS", 0)
-    geo_prebias_bigram_enable: bool = _env_bool("GEO_PREBIAS_BIGRAM_ENABLE", False)
-    geo_prebias_bigram_blend: float = _env_float("GEO_PREBIAS_BIGRAM_BLEND", 0.75)
+    geo_prebias_bigram_enable: bool = _env_bool("GEO_PREBIAS_BIGRAM_ENABLE", True)
+    geo_prebias_bigram_blend: float = _env_float("GEO_PREBIAS_BIGRAM_BLEND", 1.0)
+    geo_bigram_layers_ratio: float = _env_float("GEO_BIGRAM_LAYERS_RATIO", 0.75)
+    geo_bigram_lambda_init: float = _env_float("GEO_BIGRAM_LAMBDA_INIT", 0.3125)
 
 args = Hyperparameters()
 
@@ -2080,7 +2087,9 @@ if args.geo_prebias_enable:
             f"max_tokens={args.geo_prebias_max_tokens} mtp_weights={args.geo_prebias_mtp_weights} "
             f"embed_lr_scale_init={args.geo_prebias_embed_lr_scale_init} "
             f"embed_lr_hold_steps={args.geo_prebias_embed_lr_hold_steps} "
-            f"embed_lr_ramp_steps={args.geo_prebias_embed_lr_ramp_steps}",
+            f"embed_lr_ramp_steps={args.geo_prebias_embed_lr_ramp_steps} "
+            f"bigram_enable={args.geo_prebias_bigram_enable} bigram_blend={args.geo_prebias_bigram_blend} "
+            f"bigram_layers_ratio={args.geo_bigram_layers_ratio} bigram_lambda_init={args.geo_bigram_lambda_init}",
             console=True,
         )
         basis_np = load_or_compute_geo_basis(args, model.vocab_size, model.embed.weight.shape[1])
