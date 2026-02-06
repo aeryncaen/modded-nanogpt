@@ -12,7 +12,7 @@ VAL_RE = re.compile(
 )
 
 TRAIN_RE = re.compile(
-    r"step:(?P<step>\d+)/(?P<total>\d+)\s+train_time:(?P<tt>[0-9.]+)ms\s+step_avg:(?P<avg>[0-9.]+)ms"
+    r"step:(?P<step>\d+)/(?P<total>\d+)(?:\s+train_loss:(?P<train_loss>[0-9.]+))?\s+train_time:(?P<tt>[0-9.]+)ms\s+step_avg:(?P<avg>[0-9.]+)ms"
 )
 
 
@@ -40,6 +40,7 @@ def parse_log(path: Path) -> dict:
                 {
                     "step": int(m.group("step")),
                     "total_steps": int(m.group("total")),
+                    "train_loss": float(m.group("train_loss")) if m.group("train_loss") is not None else None,
                     "train_time_ms": float(m.group("tt")),
                     "step_avg_ms": float(m.group("avg")),
                 }
