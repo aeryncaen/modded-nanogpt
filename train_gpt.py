@@ -1674,6 +1674,9 @@ class Hyperparameters:
     geo_prebias_cache_dir: str = os.environ.get("GEO_PREBIAS_CACHE_DIR", os.path.join(data_path, "cache", "geo_prebias"))
     geo_prebias_force_recompute: bool = _env_bool("GEO_PREBIAS_FORCE_RECOMPUTE", False)
     geo_prebias_diag_every: int = _env_int("GEO_PREBIAS_DIAG_EVERY", 50)
+    geo_prebias_embed_lr_scale_init: float = _env_float("GEO_PREBIAS_EMBED_LR_SCALE_INIT", 1.0)
+    geo_prebias_embed_lr_hold_steps: int = _env_int("GEO_PREBIAS_EMBED_LR_HOLD_STEPS", 0)
+    geo_prebias_embed_lr_ramp_steps: int = _env_int("GEO_PREBIAS_EMBED_LR_RAMP_STEPS", 0)
 
 args = Hyperparameters()
 
@@ -1876,9 +1879,23 @@ class TrainingManager():
         muon_momentum = get_muon_momentum(step)
         do_adam = self._is_adam_step(step)
 
+        embed_lr_scale = 1.0
+        if args.geo_prebias_enable:
+            init_scale = max(0.0, float(args.geo_prebias_embed_lr_scale_init))
+            hold_steps = max(0, int(args.geo_prebias_embed_lr_hold_steps))
+            ramp_steps = max(0, int(args.geo_prebias_embed_lr_ramp_steps))
+            if step < hold_steps:
+                embed_lr_scale = init_scale
+            elif ramp_steps > 0 and step < hold_steps + ramp_steps:
+                t = (step - hold_steps) / ramp_steps
+                embed_lr_scale = init_scale + (1.0 - init_scale) * t
+
         # Update learning rates and momentum for all params
         for param, p_cfg in self.optimizer.param_cfgs.items():
-            p_cfg.lr = p_cfg.initial_lr * step_lr
+            effective_lr = p_cfg.initial_lr * step_lr
+            if p_cfg.label in ("embed", "lm_head"):
+                effective_lr *= embed_lr_scale
+            p_cfg.lr = effective_lr
             if p_cfg.optim == "normuon":
                 p_cfg.momentum = muon_momentum
 
@@ -1957,7 +1974,10 @@ if args.geo_prebias_enable:
     if master_process:
         print0(
             f"Geo pre-bias enabled: method={args.geo_prebias_method} blend={args.geo_prebias_blend} "
-            f"max_tokens={args.geo_prebias_max_tokens} mtp_weights={args.geo_prebias_mtp_weights}",
+            f"max_tokens={args.geo_prebias_max_tokens} mtp_weights={args.geo_prebias_mtp_weights} "
+            f"embed_lr_scale_init={args.geo_prebias_embed_lr_scale_init} "
+            f"embed_lr_hold_steps={args.geo_prebias_embed_lr_hold_steps} "
+            f"embed_lr_ramp_steps={args.geo_prebias_embed_lr_ramp_steps}",
             console=True,
         )
         basis_np = load_or_compute_geo_basis(args, model.vocab_size, model.embed.weight.shape[1])
