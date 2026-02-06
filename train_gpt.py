@@ -1369,6 +1369,17 @@ def load_or_compute_geo_basis(args, vocab_size: int, width: int) -> np.ndarray:
     np.save(cache_file, basis)
     return basis
 
+
+@torch.no_grad()
+def geo_prebias_alignment_metrics(model: nn.Module, basis_t: torch.Tensor) -> tuple[float, float, float]:
+    # Compare current embedding matrix against cached pre-bias basis.
+    E = model.embed.weight.detach().float()
+    B = basis_t.detach().float()
+    row_cos = F.cosine_similarity(E, B, dim=1).mean().item()
+    global_cos = F.cosine_similarity(E.reshape(-1), B.reshape(-1), dim=0).item()
+    l2_rmse = torch.sqrt(torch.mean((E - B) ** 2)).item()
+    return float(row_cos), float(global_cos), float(l2_rmse)
+
 BOS_ID = 50256
 
 class Shard:
@@ -1585,6 +1596,7 @@ class Hyperparameters:
     geo_prebias_chunk_tokens: int = _env_int("GEO_PREBIAS_CHUNK_TOKENS", 5_000_000)
     geo_prebias_cache_dir: str = os.environ.get("GEO_PREBIAS_CACHE_DIR", os.path.join(data_path, "cache", "geo_prebias"))
     geo_prebias_force_recompute: bool = _env_bool("GEO_PREBIAS_FORCE_RECOMPUTE", False)
+    geo_prebias_diag_every: int = _env_int("GEO_PREBIAS_DIAG_EVERY", 50)
 
 args = Hyperparameters()
 
@@ -1862,6 +1874,7 @@ model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.attn_bank.data = model.attn_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+geo_basis_for_diag = None
 
 if args.geo_prebias_enable:
     if master_process:
@@ -1876,6 +1889,7 @@ if args.geo_prebias_enable:
         basis_t = torch.zeros((model.vocab_size, model.embed.weight.shape[1]), device=device, dtype=model.embed.weight.dtype)
 
     dist.broadcast(basis_t, src=0)
+    geo_basis_for_diag = basis_t.detach().clone()
     alpha = float(args.geo_prebias_blend)
     with torch.no_grad():
         model.embed.weight.data.mul_(1.0 - alpha).add_(basis_t, alpha=alpha)
@@ -1959,6 +1973,12 @@ for step in range(train_steps + 1):
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        if args.geo_prebias_enable and geo_basis_for_diag is not None and (step % max(args.geo_prebias_diag_every, 1) == 0):
+            row_cos, global_cos, l2_rmse = geo_prebias_alignment_metrics(model, geo_basis_for_diag)
+            print0(
+                f"step:{step}/{train_steps} geo_prebias_align row_cos:{row_cos:.4f} global_cos:{global_cos:.4f} l2_rmse:{l2_rmse:.6f}",
+                console=True,
+            )
         model.train()
         # start the clock again
         torch.cuda.synchronize()
