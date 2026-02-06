@@ -31,6 +31,10 @@ torch.empty(
 import torch._dynamo as dynamo
 import torch.distributed as dist
 import torch.nn.functional as F
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 from kernels import get_kernel
@@ -1252,16 +1256,24 @@ def _load_data_shard(file: Path):
     return tokens
 
 
-def _compute_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int) -> np.ndarray:
+def _compute_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int, chunk_tokens: int = 5_000_000) -> np.ndarray:
     if tokens.size < 3:
         return np.zeros((vocab_size, width), dtype=np.float32)
     basis = np.zeros((vocab_size, width), dtype=np.float64)
     cur = tokens[2:]
     prev1 = tokens[1:-1]
     prev2 = tokens[:-2]
-    context_id = prev1.astype(np.int64) + vocab_size * prev2.astype(np.int64)
-    buckets = context_id % width
-    np.add.at(basis, (cur, buckets), 1.0)
+    n = cur.size
+    n_chunks = (n + chunk_tokens - 1) // chunk_tokens
+    for ci in _maybe_tqdm(range(n_chunks), total=n_chunks, desc="geo_prebias bucket basis"):
+        s = ci * chunk_tokens
+        e = min((ci + 1) * chunk_tokens, n)
+        cur_s = cur[s:e]
+        prev1_s = prev1[s:e]
+        prev2_s = prev2[s:e]
+        context_id = prev1_s.astype(np.int64) + vocab_size * prev2_s.astype(np.int64)
+        buckets = context_id % width
+        np.add.at(basis, (cur_s, buckets), 1.0)
     col_sum = basis.sum(axis=0, keepdims=True)
     basis = basis / np.maximum(col_sum, 1.0)
     basis = basis - basis.mean(axis=0, keepdims=True)
@@ -1270,16 +1282,24 @@ def _compute_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int) -> np
     return basis.astype(np.float32)
 
 
-def _compute_kl_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int, eps: float = 1e-8) -> np.ndarray:
+def _compute_kl_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int, eps: float = 1e-8, chunk_tokens: int = 5_000_000) -> np.ndarray:
     if tokens.size < 3:
         return np.zeros((vocab_size, width), dtype=np.float32)
     counts = np.zeros((vocab_size, width), dtype=np.float64)
     cur = tokens[2:]
     prev1 = tokens[1:-1]
     prev2 = tokens[:-2]
-    context_id = prev1.astype(np.int64) + vocab_size * prev2.astype(np.int64)
-    buckets = context_id % width
-    np.add.at(counts, (cur, buckets), 1.0)
+    n = cur.size
+    n_chunks = (n + chunk_tokens - 1) // chunk_tokens
+    for ci in _maybe_tqdm(range(n_chunks), total=n_chunks, desc="geo_prebias kl-bucket basis"):
+        s = ci * chunk_tokens
+        e = min((ci + 1) * chunk_tokens, n)
+        cur_s = cur[s:e]
+        prev1_s = prev1[s:e]
+        prev2_s = prev2[s:e]
+        context_id = prev1_s.astype(np.int64) + vocab_size * prev2_s.astype(np.int64)
+        buckets = context_id % width
+        np.add.at(counts, (cur_s, buckets), 1.0)
     col_sum = counts.sum(axis=0, keepdims=True)
     p_t_given_b = counts / np.maximum(col_sum, 1.0)
     token_sum = counts.sum(axis=1, keepdims=True)
@@ -1312,7 +1332,7 @@ def _collect_train_tokens(train_pattern: str, max_tokens: int) -> np.ndarray:
         raise RuntimeError(f"No train files matched: {train_pattern}")
     chunks = []
     n = 0
-    for f in files:
+    for f in _maybe_tqdm(files, total=len(files), desc="geo_prebias loading shards"):
         t = _load_data_shard(Path(f)).cpu().numpy().astype(np.int64)
         remain = max_tokens - n
         if remain <= 0:
@@ -1341,9 +1361,9 @@ def load_or_compute_geo_basis(args: Hyperparameters, vocab_size: int, width: int
 
     tokens = _collect_train_tokens(args.train_files, args.geo_prebias_max_tokens)
     if args.geo_prebias_method == "bucket":
-        basis = _compute_bucket_basis(tokens, vocab_size, width)
+        basis = _compute_bucket_basis(tokens, vocab_size, width, chunk_tokens=args.geo_prebias_chunk_tokens)
     elif args.geo_prebias_method == "kl_bucket":
-        basis = _compute_kl_bucket_basis(tokens, vocab_size, width)
+        basis = _compute_kl_bucket_basis(tokens, vocab_size, width, chunk_tokens=args.geo_prebias_chunk_tokens)
     else:
         raise ValueError(f"Unknown GEO_PREBIAS_METHOD: {args.geo_prebias_method}")
     np.save(cache_file, basis)
@@ -1532,6 +1552,12 @@ def _env_float(name: str, default: float) -> float:
     v = os.environ.get(name)
     return float(v) if v is not None else default
 
+
+def _maybe_tqdm(iterable, *, total: int | None = None, desc: str = ""):
+    if master_process and sys.stderr.isatty() and tqdm is not None:
+        return tqdm(iterable, total=total, desc=desc, leave=False)
+    return iterable
+
 @dataclass
 class Hyperparameters:
     # data
@@ -1556,6 +1582,7 @@ class Hyperparameters:
     geo_prebias_method: str = os.environ.get("GEO_PREBIAS_METHOD", "kl_bucket")
     geo_prebias_blend: float = _env_float("GEO_PREBIAS_BLEND", 0.8)
     geo_prebias_max_tokens: int = _env_int("GEO_PREBIAS_MAX_TOKENS", 50_000_000)
+    geo_prebias_chunk_tokens: int = _env_int("GEO_PREBIAS_CHUNK_TOKENS", 5_000_000)
     geo_prebias_cache_dir: str = os.environ.get("GEO_PREBIAS_CACHE_DIR", os.path.join(data_path, "cache", "geo_prebias"))
     geo_prebias_force_recompute: bool = _env_bool("GEO_PREBIAS_FORCE_RECOMPUTE", False)
 
