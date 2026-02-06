@@ -1311,6 +1311,81 @@ def _compute_kl_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int, ep
     return basis.astype(np.float32)
 
 
+def _compute_kl_bucket_basis_bigram(
+    tokens: np.ndarray,
+    bigram_vocab_size: int,
+    width: int,
+    mtp_weights: list[float] | None = None,
+    eps: float = 1e-8,
+    chunk_tokens: int = 2_000_000,
+) -> np.ndarray:
+    """KL bucket basis in bigram hash space, optionally MTP-weighted.
+
+    The bigram hash encodes (prev, curr).  Context for the KL bucket is the
+    token *before* the pair (prev2), since the pair itself is already captured
+    by the hash.  When mtp_weights is provided, we also accumulate counts for
+    future-horizon bigrams: at horizon h the target bigram is
+    hash(tokens[i+h], tokens[i+h-1]) with context tokens[i-1].
+    """
+    if mtp_weights is None:
+        mtp_weights = [1.0]
+    if tokens.size < 4:
+        return np.zeros((bigram_vocab_size, width), dtype=np.float32)
+
+    # Bigram hash constants (must match get_bigram_hash in the model)
+    RAND_INT_1 = np.int64(36313)
+    RAND_INT_2 = np.int64(27191)
+    MOD = np.int64(bigram_vocab_size - 1)
+
+    counts = np.zeros((bigram_vocab_size, width), dtype=np.float64)
+
+    for h, w in enumerate(mtp_weights):
+        if w == 0.0:
+            continue
+        # At horizon h (0-based): target bigram at positions (i+h-1, i+h),
+        # context token at position i-1.
+        # Need: i-1 >= 0, i+h < len(tokens), i+h-1 >= 0
+        # So i >= 1, i+h < N  =>  i ranges [1, N-h-1]
+        # Positions: context=tokens[i-1], prev_bg=tokens[i+h-1], curr_bg=tokens[i+h]
+        min_pos = 1
+        max_pos = len(tokens) - h - 1
+        if max_pos <= min_pos:
+            continue
+
+        context = tokens[min_pos - 1 : max_pos - 1]   # tokens[i-1]
+        prev_bg = tokens[min_pos + h - 1 : max_pos + h - 1]  # tokens[i+h-1]
+        curr_bg = tokens[min_pos + h : max_pos + h]           # tokens[i+h]
+
+        n = context.size
+        n_chunks = (n + chunk_tokens - 1) // chunk_tokens
+        desc = f"geo_prebias bigram kl-bucket h{h}"
+
+        for ci in _maybe_tqdm(range(n_chunks), total=n_chunks, desc=desc):
+            s = ci * chunk_tokens
+            e = min((ci + 1) * chunk_tokens, n)
+            ctx_s = context[s:e].astype(np.int64)
+            pbg_s = prev_bg[s:e].astype(np.int64)
+            cbg_s = curr_bg[s:e].astype(np.int64)
+
+            # Bigram hash of the target pair
+            bh = np.bitwise_xor(RAND_INT_1 * cbg_s, RAND_INT_2 * pbg_s) % MOD
+
+            # Context bucket: just the token before the pair
+            buckets = ctx_s % width
+
+            np.add.at(counts, (bh, buckets), float(w))
+
+    col_sum = counts.sum(axis=0, keepdims=True)
+    p_bh_given_b = counts / np.maximum(col_sum, 1.0)
+    bh_sum = counts.sum(axis=1, keepdims=True)
+    p_bh = bh_sum / np.maximum(np.sum(counts), 1.0)
+    basis = np.log(p_bh_given_b + eps) - np.log(p_bh + eps)
+    basis = basis - basis.mean(axis=0, keepdims=True)
+    col_norm = np.linalg.norm(basis, axis=0, keepdims=True)
+    basis = basis / np.maximum(col_norm, 1e-12)
+    return basis.astype(np.float32)
+
+
 def _parse_mtp_weights(spec: str) -> list[float]:
     vals = []
     for part in spec.split(","):
@@ -1442,6 +1517,32 @@ def load_or_compute_geo_basis(args, vocab_size: int, width: int) -> np.ndarray:
         )
     else:
         raise ValueError(f"Unknown GEO_PREBIAS_METHOD: {args.geo_prebias_method}")
+    np.save(cache_file, basis)
+    return basis
+
+
+def load_or_compute_geo_basis_bigram(args, bigram_vocab_size: int, width: int) -> np.ndarray:
+    train_files = sorted(glob.glob(args.train_files))
+    if not train_files:
+        raise RuntimeError(f"No train files matched: {args.train_files}")
+    mtp_w = _parse_mtp_weights(args.geo_prebias_mtp_weights)
+    mtp_sig = hashlib.sha1(args.geo_prebias_mtp_weights.encode("utf-8")).hexdigest()[:8]
+    sig = _build_dataset_signature(train_files, bigram_vocab_size, width, "bigram_kl_bucket", args.geo_prebias_max_tokens)
+    sig = f"{sig}_{mtp_sig}"
+    cache_dir = Path(args.geo_prebias_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"basis_bigram_{sig}.npy"
+    if cache_file.exists() and not args.geo_prebias_force_recompute:
+        return np.load(cache_file)
+
+    tokens = _collect_train_tokens(args.train_files, args.geo_prebias_max_tokens)
+    basis = _compute_kl_bucket_basis_bigram(
+        tokens,
+        bigram_vocab_size,
+        width,
+        mtp_weights=mtp_w,
+        chunk_tokens=args.geo_prebias_chunk_tokens,
+    )
     np.save(cache_file, basis)
     return basis
 
@@ -1677,6 +1778,8 @@ class Hyperparameters:
     geo_prebias_embed_lr_scale_init: float = _env_float("GEO_PREBIAS_EMBED_LR_SCALE_INIT", 1.0)
     geo_prebias_embed_lr_hold_steps: int = _env_int("GEO_PREBIAS_EMBED_LR_HOLD_STEPS", 0)
     geo_prebias_embed_lr_ramp_steps: int = _env_int("GEO_PREBIAS_EMBED_LR_RAMP_STEPS", 0)
+    geo_prebias_bigram_enable: bool = _env_bool("GEO_PREBIAS_BIGRAM_ENABLE", False)
+    geo_prebias_bigram_blend: float = _env_float("GEO_PREBIAS_BIGRAM_BLEND", 0.75)
 
 args = Hyperparameters()
 
@@ -1994,6 +2097,31 @@ if args.geo_prebias_enable:
 
     if master_process:
         print0("Geo pre-bias applied to embed/lm_head and synchronized", console=True)
+
+    # Bigram embedding pre-bias
+    if args.geo_prebias_bigram_enable:
+        bigram_dim = model.bigram_embed.weight.shape[1]
+        if master_process:
+            print0(
+                f"Geo pre-bias bigram: blend={args.geo_prebias_bigram_blend} "
+                f"bigram_vocab={args.bigram_vocab_size} dim={bigram_dim}",
+                console=True,
+            )
+            bigram_basis_np = load_or_compute_geo_basis_bigram(args, args.bigram_vocab_size, bigram_dim)
+            bigram_basis_t = torch.from_numpy(bigram_basis_np).to(device=device, dtype=model.bigram_embed.weight.dtype)
+        else:
+            bigram_basis_t = torch.zeros(
+                (args.bigram_vocab_size, bigram_dim), device=device, dtype=model.bigram_embed.weight.dtype
+            )
+
+        dist.broadcast(bigram_basis_t, src=0)
+        bg_alpha = float(args.geo_prebias_bigram_blend)
+        with torch.no_grad():
+            # bigram_embed starts at zeros, so blend is just scaling the basis
+            model.bigram_embed.weight.data.mul_(1.0 - bg_alpha).add_(bigram_basis_t, alpha=bg_alpha)
+
+        if master_process:
+            print0("Geo pre-bias applied to bigram_embed and synchronized", console=True)
 
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
