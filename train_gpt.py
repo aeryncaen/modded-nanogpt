@@ -1311,6 +1311,71 @@ def _compute_kl_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int, ep
     return basis.astype(np.float32)
 
 
+def _parse_mtp_weights(spec: str) -> list[float]:
+    vals = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        vals.append(float(part))
+    if not vals:
+        return [1.0]
+    return vals
+
+
+def _compute_kl_bucket_mtp_basis(
+    tokens: np.ndarray,
+    vocab_size: int,
+    width: int,
+    mtp_weights: list[float],
+    eps: float = 1e-8,
+    chunk_tokens: int = 5_000_000,
+) -> np.ndarray:
+    # Objective-skewed KL bucket basis using weighted multi-token prediction horizons.
+    if tokens.size < 3:
+        return np.zeros((vocab_size, width), dtype=np.float32)
+
+    counts = np.zeros((vocab_size, width), dtype=np.float64)
+    max_h = len(mtp_weights)
+
+    for h, w in enumerate(mtp_weights, start=1):
+        if w == 0.0:
+            continue
+        # target token at i+h, context from (i-1, i)
+        # Requires i >= 1 and i+h < N
+        if tokens.size - h - 1 <= 0:
+            continue
+        cur = tokens[h + 1 :]
+        prev1 = tokens[1 : -h]
+        prev2 = tokens[: -(h + 1)]
+
+        n = cur.size
+        n_chunks = (n + chunk_tokens - 1) // chunk_tokens
+        desc = f"geo_prebias kl-mtp h{h}"
+        for ci in _maybe_tqdm(range(n_chunks), total=n_chunks, desc=desc):
+            s = ci * chunk_tokens
+            e = min((ci + 1) * chunk_tokens, n)
+            cur_s = cur[s:e]
+            prev1_s = prev1[s:e]
+            prev2_s = prev2[s:e]
+            context_id = prev1_s.astype(np.int64) + vocab_size * prev2_s.astype(np.int64)
+            buckets = context_id % width
+            np.add.at(counts, (cur_s, buckets), float(w))
+
+    col_sum = counts.sum(axis=0, keepdims=True)
+    p_t_given_b = counts / np.maximum(col_sum, 1.0)
+    token_sum = counts.sum(axis=1, keepdims=True)
+    p_t = token_sum / np.maximum(np.sum(counts), 1.0)
+
+    basis = np.log(p_t_given_b + eps) - np.log(p_t + eps)
+    # softcap-like compression to align with fused softcapped objective behavior
+    basis = np.tanh(0.5 * basis)
+    basis = basis - basis.mean(axis=0, keepdims=True)
+    col_norm = np.linalg.norm(basis, axis=0, keepdims=True)
+    basis = basis / np.maximum(col_norm, 1e-12)
+    return basis.astype(np.float32)
+
+
 def _build_dataset_signature(files: list[str], vocab_size: int, width: int, method: str, max_tokens: int) -> str:
     h = hashlib.sha1()
     h.update(str(vocab_size).encode("utf-8"))
@@ -1353,6 +1418,8 @@ def load_or_compute_geo_basis(args, vocab_size: int, width: int) -> np.ndarray:
     if not train_files:
         raise RuntimeError(f"No train files matched: {args.train_files}")
     sig = _build_dataset_signature(train_files, vocab_size, width, args.geo_prebias_method, args.geo_prebias_max_tokens)
+    if args.geo_prebias_method == "kl_bucket_mtp":
+        sig = f"{sig}_{hashlib.sha1(args.geo_prebias_mtp_weights.encode('utf-8')).hexdigest()[:8]}"
     cache_dir = Path(args.geo_prebias_cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"basis_{sig}.npy"
@@ -1364,6 +1431,15 @@ def load_or_compute_geo_basis(args, vocab_size: int, width: int) -> np.ndarray:
         basis = _compute_bucket_basis(tokens, vocab_size, width, chunk_tokens=args.geo_prebias_chunk_tokens)
     elif args.geo_prebias_method == "kl_bucket":
         basis = _compute_kl_bucket_basis(tokens, vocab_size, width, chunk_tokens=args.geo_prebias_chunk_tokens)
+    elif args.geo_prebias_method == "kl_bucket_mtp":
+        mtp_w = _parse_mtp_weights(args.geo_prebias_mtp_weights)
+        basis = _compute_kl_bucket_mtp_basis(
+            tokens,
+            vocab_size,
+            width,
+            mtp_weights=mtp_w,
+            chunk_tokens=args.geo_prebias_chunk_tokens,
+        )
     else:
         raise ValueError(f"Unknown GEO_PREBIAS_METHOD: {args.geo_prebias_method}")
     np.save(cache_file, basis)
@@ -1591,6 +1667,7 @@ class Hyperparameters:
     # geo pre-bias init (dataset-specific, cached)
     geo_prebias_enable: bool = _env_bool("GEO_PREBIAS_ENABLE", False)
     geo_prebias_method: str = os.environ.get("GEO_PREBIAS_METHOD", "kl_bucket")
+    geo_prebias_mtp_weights: str = os.environ.get("GEO_PREBIAS_MTP_WEIGHTS", "1.0,0.5,0.25")
     geo_prebias_blend: float = _env_float("GEO_PREBIAS_BLEND", 0.8)
     geo_prebias_max_tokens: int = _env_int("GEO_PREBIAS_MAX_TOKENS", 50_000_000)
     geo_prebias_chunk_tokens: int = _env_int("GEO_PREBIAS_CHUNK_TOKENS", 5_000_000)
@@ -1880,7 +1957,7 @@ if args.geo_prebias_enable:
     if master_process:
         print0(
             f"Geo pre-bias enabled: method={args.geo_prebias_method} blend={args.geo_prebias_blend} "
-            f"max_tokens={args.geo_prebias_max_tokens}",
+            f"max_tokens={args.geo_prebias_max_tokens} mtp_weights={args.geo_prebias_mtp_weights}",
             console=True,
         )
         basis_np = load_or_compute_geo_basis(args, model.vocab_size, model.embed.weight.shape[1])
