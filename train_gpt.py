@@ -2091,18 +2091,21 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     train_loss_step = 0.0
+    train_loss_tok_step = 0.0
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(training_manager.train_loader_send_args)
         loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
         train_loss_step += float(loss.item())
+        train_loss_tok_step += float(loss.item()) / max(int(targets.numel()), 1)
         (loss * grad_scale).backward()
     train_loss_step /= grad_accum_steps
+    train_loss_tok_step /= grad_accum_steps
     training_manager.step_optimizers(step)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(
-        f"step:{step+1}/{train_steps} train_loss:{train_loss_step:.4f} "
+        f"step:{step+1}/{train_steps} train_loss:{train_loss_step:.4f} train_loss_tok:{train_loss_tok_step:.6f} "
         f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms",
         console=True,
     )
