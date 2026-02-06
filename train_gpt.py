@@ -10,6 +10,7 @@ with open(os.path.join(os.path.dirname(sys.argv[0]), 'triton_kernels.py'), 'r') 
 
 import copy
 import glob
+import hashlib
 import math
 import threading
 import time
@@ -18,6 +19,7 @@ from dataclasses import dataclass
 from itertools import accumulate, pairwise
 from pathlib import Path
 import gc
+import numpy as np
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -1249,6 +1251,104 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
+
+def _compute_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int) -> np.ndarray:
+    if tokens.size < 3:
+        return np.zeros((vocab_size, width), dtype=np.float32)
+    basis = np.zeros((vocab_size, width), dtype=np.float64)
+    cur = tokens[2:]
+    prev1 = tokens[1:-1]
+    prev2 = tokens[:-2]
+    context_id = prev1.astype(np.int64) + vocab_size * prev2.astype(np.int64)
+    buckets = context_id % width
+    np.add.at(basis, (cur, buckets), 1.0)
+    col_sum = basis.sum(axis=0, keepdims=True)
+    basis = basis / np.maximum(col_sum, 1.0)
+    basis = basis - basis.mean(axis=0, keepdims=True)
+    col_norm = np.linalg.norm(basis, axis=0, keepdims=True)
+    basis = basis / np.maximum(col_norm, 1e-12)
+    return basis.astype(np.float32)
+
+
+def _compute_kl_bucket_basis(tokens: np.ndarray, vocab_size: int, width: int, eps: float = 1e-8) -> np.ndarray:
+    if tokens.size < 3:
+        return np.zeros((vocab_size, width), dtype=np.float32)
+    counts = np.zeros((vocab_size, width), dtype=np.float64)
+    cur = tokens[2:]
+    prev1 = tokens[1:-1]
+    prev2 = tokens[:-2]
+    context_id = prev1.astype(np.int64) + vocab_size * prev2.astype(np.int64)
+    buckets = context_id % width
+    np.add.at(counts, (cur, buckets), 1.0)
+    col_sum = counts.sum(axis=0, keepdims=True)
+    p_t_given_b = counts / np.maximum(col_sum, 1.0)
+    token_sum = counts.sum(axis=1, keepdims=True)
+    p_t = token_sum / np.maximum(np.sum(counts), 1.0)
+    basis = np.log(p_t_given_b + eps) - np.log(p_t + eps)
+    basis = basis - basis.mean(axis=0, keepdims=True)
+    col_norm = np.linalg.norm(basis, axis=0, keepdims=True)
+    basis = basis / np.maximum(col_norm, 1e-12)
+    return basis.astype(np.float32)
+
+
+def _build_dataset_signature(files: list[str], vocab_size: int, width: int, method: str, max_tokens: int) -> str:
+    h = hashlib.sha1()
+    h.update(str(vocab_size).encode("utf-8"))
+    h.update(str(width).encode("utf-8"))
+    h.update(method.encode("utf-8"))
+    h.update(str(max_tokens).encode("utf-8"))
+    for f in files:
+        p = Path(f)
+        st = p.stat()
+        h.update(str(p).encode("utf-8"))
+        h.update(str(st.st_size).encode("utf-8"))
+        h.update(str(int(st.st_mtime)).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _collect_train_tokens(train_pattern: str, max_tokens: int) -> np.ndarray:
+    files = sorted(glob.glob(train_pattern))
+    if not files:
+        raise RuntimeError(f"No train files matched: {train_pattern}")
+    chunks = []
+    n = 0
+    for f in files:
+        t = _load_data_shard(Path(f)).cpu().numpy().astype(np.int64)
+        remain = max_tokens - n
+        if remain <= 0:
+            break
+        if t.size > remain:
+            t = t[:remain]
+        chunks.append(t)
+        n += t.size
+        if n >= max_tokens:
+            break
+    if not chunks:
+        return np.zeros((0,), dtype=np.int64)
+    return np.concatenate(chunks, axis=0)
+
+
+def load_or_compute_geo_basis(args: Hyperparameters, vocab_size: int, width: int) -> np.ndarray:
+    train_files = sorted(glob.glob(args.train_files))
+    if not train_files:
+        raise RuntimeError(f"No train files matched: {args.train_files}")
+    sig = _build_dataset_signature(train_files, vocab_size, width, args.geo_prebias_method, args.geo_prebias_max_tokens)
+    cache_dir = Path(args.geo_prebias_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"basis_{sig}.npy"
+    if cache_file.exists() and not args.geo_prebias_force_recompute:
+        return np.load(cache_file)
+
+    tokens = _collect_train_tokens(args.train_files, args.geo_prebias_max_tokens)
+    if args.geo_prebias_method == "bucket":
+        basis = _compute_bucket_basis(tokens, vocab_size, width)
+    elif args.geo_prebias_method == "kl_bucket":
+        basis = _compute_kl_bucket_basis(tokens, vocab_size, width)
+    else:
+        raise ValueError(f"Unknown GEO_PREBIAS_METHOD: {args.geo_prebias_method}")
+    np.save(cache_file, basis)
+    return basis
+
 BOS_ID = 50256
 
 class Shard:
@@ -1416,6 +1516,22 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
 # -----------------------------------------------------------------------------
 # Training Management
 
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    return int(v) if v is not None else default
+
+
+def _env_float(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    return float(v) if v is not None else default
+
 @dataclass
 class Hyperparameters:
     # data
@@ -1435,6 +1551,13 @@ class Hyperparameters:
     save_checkpoint: bool = False
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
+    # geo pre-bias init (dataset-specific, cached)
+    geo_prebias_enable: bool = _env_bool("GEO_PREBIAS_ENABLE", False)
+    geo_prebias_method: str = os.environ.get("GEO_PREBIAS_METHOD", "kl_bucket")
+    geo_prebias_blend: float = _env_float("GEO_PREBIAS_BLEND", 0.8)
+    geo_prebias_max_tokens: int = _env_int("GEO_PREBIAS_MAX_TOKENS", 50_000_000)
+    geo_prebias_cache_dir: str = os.environ.get("GEO_PREBIAS_CACHE_DIR", os.path.join(data_path, "cache", "geo_prebias"))
+    geo_prebias_force_recompute: bool = _env_bool("GEO_PREBIAS_FORCE_RECOMPUTE", False)
 
 args = Hyperparameters()
 
@@ -1712,6 +1835,28 @@ model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.attn_bank.data = model.attn_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+
+if args.geo_prebias_enable:
+    if master_process:
+        print0(
+            f"Geo pre-bias enabled: method={args.geo_prebias_method} blend={args.geo_prebias_blend} "
+            f"max_tokens={args.geo_prebias_max_tokens}",
+            console=True,
+        )
+        basis_np = load_or_compute_geo_basis(args, model.vocab_size, model.embed.weight.shape[1])
+        basis_t = torch.from_numpy(basis_np).to(device=device, dtype=model.embed.weight.dtype)
+    else:
+        basis_t = torch.zeros((model.vocab_size, model.embed.weight.shape[1]), device=device, dtype=model.embed.weight.dtype)
+
+    dist.broadcast(basis_t, src=0)
+    alpha = float(args.geo_prebias_blend)
+    with torch.no_grad():
+        model.embed.weight.data.mul_(1.0 - alpha).add_(basis_t, alpha=alpha)
+        model.lm_head.weight.data.copy_(model.embed.weight.data.T)
+
+    if master_process:
+        print0("Geo pre-bias applied to embed/lm_head and synchronized", console=True)
+
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
