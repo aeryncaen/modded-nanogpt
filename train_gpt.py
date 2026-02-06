@@ -1348,7 +1348,7 @@ def _collect_train_tokens(train_pattern: str, max_tokens: int) -> np.ndarray:
     return np.concatenate(chunks, axis=0)
 
 
-def load_or_compute_geo_basis(args: Hyperparameters, vocab_size: int, width: int) -> np.ndarray:
+def load_or_compute_geo_basis(args, vocab_size: int, width: int) -> np.ndarray:
     train_files = sorted(glob.glob(args.train_files))
     if not train_files:
         raise RuntimeError(f"No train files matched: {args.train_files}")
