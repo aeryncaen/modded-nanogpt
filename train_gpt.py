@@ -911,7 +911,7 @@ flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_inte
 
 # Channel-group shift for shift-attention: shifts groups of channels in K and V
 # by different causal offsets. Same approach as ShiftAttention in train_fineweb_vanilla.py.
-SHIFT_OFFSETS = (0, 1, 2, 4)
+SHIFT_OFFSETS = (0, 0, 1, 3)
 
 def _shift_kv(x: Tensor, shifts: tuple = SHIFT_OFFSETS) -> Tensor:
     """Shift channel groups within each head along the time axis.
