@@ -922,6 +922,29 @@ class AttnArgs:
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
+# Channel-group shift for shift-attention: shifts groups of channels in K and V
+# by different causal offsets. Same approach as ShiftAttention in train_fineweb_vanilla.py.
+SHIFT_OFFSETS = (0, 1, 2, 4)
+
+def _shift_kv(x: Tensor, shifts: tuple = SHIFT_OFFSETS) -> Tensor:
+    """Shift channel groups within each head along the time axis.
+    x: (B, T, H, D).  Group i gets shifted by shifts[i] positions causally.
+    Positions before the shift offset get zeros for that group.
+    torch.compile-friendly: static loop, simple slicing, no .item() calls.
+    """
+    head_dim = x.size(-1)
+    num_groups = len(shifts)
+    cpg = head_dim // num_groups  # channels per group
+
+    out = torch.zeros_like(x)
+    for i, s in enumerate(shifts):
+        sl = slice(i * cpg, (i + 1) * cpg)
+        if s == 0:
+            out[:, :, :, sl] = x[:, :, :, sl]
+        else:
+            out[:, s:, :, sl] = x[:, :-s, :, sl]
+    return out
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
@@ -961,16 +984,16 @@ class CausalSelfAttention(nn.Module):
         assert T % 16 == 0
         # unpack attention args
         cos, sin = attn_args.cos, attn_args.sin
-        ve, sa_lambdas, key_offset = attn_args.ve, attn_args.sa_lambdas, attn_args.key_offset
+        ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
         seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
 
         q, k, v = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = rotary(q, cos, sin), rotary(k, cos, sin)
-        if key_offset:
-            # shift keys forward for the stationary head dims. Enables 1-layer induction.
-            k[:, 1:, :, self.head_dim // 4:self.head_dim // 2] = k[:, :-1, :, self.head_dim // 4:self.head_dim // 2]
-            k[:, 1:, :, 3 * self.head_dim // 4:] = k[:, :-1, :, 3 * self.head_dim // 4:]
+        # Shift-attention: shift channel groups in K and V by different causal
+        # offsets (0,1,2,4). Generalizes the original key_offset.
+        k = _shift_kv(k)
+        v = _shift_kv(v)
         if ve is not None:
             ve_gate_out = 2 * torch.sigmoid(self.value_embed_gate(x[..., :self.value_embed_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
             v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
