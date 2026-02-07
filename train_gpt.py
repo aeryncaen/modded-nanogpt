@@ -1403,6 +1403,22 @@ def _parse_mtp_weights(spec: str) -> list[float]:
     return vals
 
 
+def _apply_basis_rank(basis: np.ndarray, rank: int) -> np.ndarray:
+    """Optional low-rank approximation of a basis matrix.
+
+    rank <= 0 means no truncation (full rank).
+    """
+    if rank <= 0:
+        return basis.astype(np.float32)
+    m, n = basis.shape
+    r = min(rank, m, n)
+    if r >= min(m, n):
+        return basis.astype(np.float32)
+    u, s, vh = np.linalg.svd(basis.astype(np.float64), full_matrices=False)
+    out = (u[:, :r] * s[:r]) @ vh[:r, :]
+    return out.astype(np.float32)
+
+
 def _compute_kl_bucket_mtp_basis(
     tokens: np.ndarray,
     vocab_size: int,
@@ -1500,6 +1516,7 @@ def load_or_compute_geo_basis(args, vocab_size: int, width: int) -> np.ndarray:
     sig = _build_dataset_signature(train_files, vocab_size, width, args.geo_prebias_method, args.geo_prebias_max_tokens)
     if args.geo_prebias_method == "kl_bucket_mtp":
         sig = f"{sig}_{hashlib.sha1(args.geo_prebias_mtp_weights.encode('utf-8')).hexdigest()[:8]}"
+    sig = f"{sig}_r{int(args.geo_prebias_rank)}"
     cache_dir = Path(args.geo_prebias_cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"basis_{sig}.npy"
@@ -1522,6 +1539,7 @@ def load_or_compute_geo_basis(args, vocab_size: int, width: int) -> np.ndarray:
         )
     else:
         raise ValueError(f"Unknown GEO_PREBIAS_METHOD: {args.geo_prebias_method}")
+    basis = _apply_basis_rank(basis, int(args.geo_prebias_rank))
     np.save(cache_file, basis)
     return basis
 
@@ -1533,7 +1551,7 @@ def load_or_compute_geo_basis_bigram(args, bigram_vocab_size: int, width: int) -
     mtp_w = _parse_mtp_weights(args.geo_prebias_mtp_weights)
     mtp_sig = hashlib.sha1(args.geo_prebias_mtp_weights.encode("utf-8")).hexdigest()[:8]
     sig = _build_dataset_signature(train_files, bigram_vocab_size, width, "bigram_kl_bucket", args.geo_prebias_max_tokens)
-    sig = f"{sig}_{mtp_sig}"
+    sig = f"{sig}_{mtp_sig}_r{int(args.geo_prebias_bigram_rank)}"
     cache_dir = Path(args.geo_prebias_cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"basis_bigram_{sig}.npy"
@@ -1548,6 +1566,7 @@ def load_or_compute_geo_basis_bigram(args, bigram_vocab_size: int, width: int) -
         mtp_weights=mtp_w,
         chunk_tokens=args.geo_prebias_chunk_tokens,
     )
+    basis = _apply_basis_rank(basis, int(args.geo_prebias_bigram_rank))
     np.save(cache_file, basis)
     return basis
 
@@ -1775,6 +1794,7 @@ class Hyperparameters:
     geo_prebias_method: str = os.environ.get("GEO_PREBIAS_METHOD", "kl_bucket")
     geo_prebias_mtp_weights: str = os.environ.get("GEO_PREBIAS_MTP_WEIGHTS", "1.0,0.5,0.25")
     geo_prebias_blend: float = _env_float("GEO_PREBIAS_BLEND", 0.75)
+    geo_prebias_rank: int = _env_int("GEO_PREBIAS_RANK", 1)
     geo_prebias_max_tokens: int = _env_int("GEO_PREBIAS_MAX_TOKENS", 50_000_000)
     geo_prebias_chunk_tokens: int = _env_int("GEO_PREBIAS_CHUNK_TOKENS", 5_000_000)
     geo_prebias_cache_dir: str = os.environ.get("GEO_PREBIAS_CACHE_DIR", os.path.join(data_path, "cache", "geo_prebias"))
@@ -1785,9 +1805,11 @@ class Hyperparameters:
     geo_prebias_embed_lr_ramp_steps: int = _env_int("GEO_PREBIAS_EMBED_LR_RAMP_STEPS", 0)
     geo_prebias_bigram_enable: bool = _env_bool("GEO_PREBIAS_BIGRAM_ENABLE", True)
     geo_prebias_bigram_blend: float = _env_float("GEO_PREBIAS_BIGRAM_BLEND", 1.0)
+    geo_prebias_bigram_rank: int = _env_int("GEO_PREBIAS_BIGRAM_RANK", 1)
     geo_bigram_layers_ratio: float = _env_float("GEO_BIGRAM_LAYERS_RATIO", 0.75)
     geo_bigram_lambda_init: float = _env_float("GEO_BIGRAM_LAMBDA_INIT", 0.3125)
     mtp_objective_enable: bool = _env_bool("MTP_OBJECTIVE_ENABLE", True)
+    mtp_objective_mode: str = os.environ.get("MTP_OBJECTIVE_MODE", "default")
 
 args = Hyperparameters()
 
@@ -1866,6 +1888,19 @@ TRAINING_STAGES = [
     TrainingStage(batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
+
+if args.mtp_objective_mode == "late_aux" and args.mtp_objective_enable:
+    # Single-token CE dominates early; MTP ramps in later as auxiliary signal.
+    TRAINING_STAGES = [
+        TrainingStage(duration=1/3, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
+                      mtp_weights_start=[1.0, 0.0, 0.0], mtp_weights_end=[1.0, 0.0, 0.0]),
+        TrainingStage(duration=1/3, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,
+                      mtp_weights_start=[1.0, 0.0, 0.0], mtp_weights_end=[1.0, 0.25, 0.0]),
+        TrainingStage(duration=1/3, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,
+                      mtp_weights_start=[1.0, 0.25, 0.0], mtp_weights_end=[1.0, 0.5, 0.25]),
+        TrainingStage(batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,
+                      mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.25]),
+    ]
 
 if not args.mtp_objective_enable:
     # Collapse objective to single-token next-token prediction for all stages.
@@ -2072,6 +2107,7 @@ print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
 print0(f"MTP objective enabled: {args.mtp_objective_enable}", console=True)
+print0(f"MTP objective mode: {args.mtp_objective_mode}", console=True)
 
 def nvidia_smi():
     import subprocess  # avoid top level import
@@ -2100,6 +2136,7 @@ if args.geo_prebias_enable:
     if master_process:
         print0(
             f"Geo pre-bias enabled: method={args.geo_prebias_method} blend={args.geo_prebias_blend} "
+            f"rank={args.geo_prebias_rank} "
             f"max_tokens={args.geo_prebias_max_tokens} mtp_weights={args.geo_prebias_mtp_weights} "
             f"embed_lr_scale_init={args.geo_prebias_embed_lr_scale_init} "
             f"embed_lr_hold_steps={args.geo_prebias_embed_lr_hold_steps} "
@@ -2129,7 +2166,7 @@ if args.geo_prebias_enable:
         if master_process:
             print0(
                 f"Geo pre-bias bigram: blend={args.geo_prebias_bigram_blend} "
-                f"bigram_vocab={args.bigram_vocab_size} dim={bigram_dim}",
+                f"rank={args.geo_prebias_bigram_rank} bigram_vocab={args.bigram_vocab_size} dim={bigram_dim}",
                 console=True,
             )
             bigram_basis_np = load_or_compute_geo_basis_bigram(args, args.bigram_vocab_size, bigram_dim)
