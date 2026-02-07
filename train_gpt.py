@@ -1787,6 +1787,7 @@ class Hyperparameters:
     geo_prebias_bigram_blend: float = _env_float("GEO_PREBIAS_BIGRAM_BLEND", 1.0)
     geo_bigram_layers_ratio: float = _env_float("GEO_BIGRAM_LAYERS_RATIO", 0.75)
     geo_bigram_lambda_init: float = _env_float("GEO_BIGRAM_LAMBDA_INIT", 0.3125)
+    mtp_objective_enable: bool = _env_bool("MTP_OBJECTIVE_ENABLE", True)
 
 args = Hyperparameters()
 
@@ -1865,6 +1866,20 @@ TRAINING_STAGES = [
     TrainingStage(batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
+
+if not args.mtp_objective_enable:
+    # Collapse objective to single-token next-token prediction for all stages.
+    TRAINING_STAGES = [
+        TrainingStage(
+            duration=s.duration,
+            batch_size=s.batch_size,
+            window_sizes=s.window_sizes,
+            lr_mul=s.lr_mul,
+            mtp_weights_start=[1.0],
+            mtp_weights_end=[1.0],
+        )
+        for s in TRAINING_STAGES
+    ]
 
 training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
@@ -2056,6 +2071,7 @@ print0("="*100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
+print0(f"MTP objective enabled: {args.mtp_objective_enable}", console=True)
 
 def nvidia_smi():
     import subprocess  # avoid top level import
