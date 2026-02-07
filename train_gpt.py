@@ -916,18 +916,21 @@ SHIFT_OFFSETS = (0, 0, 1, 3)
 def _shift_kv(x: Tensor, shifts: tuple = SHIFT_OFFSETS) -> Tensor:
     """Shift channel groups within each head along the time axis.
     x: (B, T, H, D).  Group i gets shifted by shifts[i] positions causally.
-    In-place style: early positions keep their own values (no zero-fill).
+    Out-of-place: positions before the shift offset get zeros.
     torch.compile-friendly: static loop, simple slicing, no .item() calls.
     """
     head_dim = x.size(-1)
     num_groups = len(shifts)
     cpg = head_dim // num_groups  # channels per group
 
+    out = torch.zeros_like(x)
     for i, s in enumerate(shifts):
-        if s > 0:
-            sl = slice(i * cpg, (i + 1) * cpg)
-            x[:, s:, :, sl] = x[:, :-s, :, sl]
-    return x
+        sl = slice(i * cpg, (i + 1) * cpg)
+        if s == 0:
+            out[:, :, :, sl] = x[:, :, :, sl]
+        else:
+            out[:, s:, :, sl] = x[:, :-s, :, sl]
+    return out
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
