@@ -963,12 +963,11 @@ class CausalSelfAttention(nn.Module):
         if not self.paired:
             q, k = yarn.rotary(q), yarn.rotary(k)
 
-            # Shift-attention: shift channel groups in K by different causal
-            # offsets (0,1,2,4). V left unshifted — shifting V showed no benefit.
-            # Generalizes the original key_offset (which shifted only half the
-            # channels by 1). Applied after RoPE so shifted channels retain
+            # Shift-attention: shift channel groups in K and V by different causal
+            # offsets (0,1,2,4). Applied after RoPE so shifted channels retain
             # their source-position encoding.
             k = _shift_kv(k)
+            v = _shift_kv(v)
 
             if ve is not None:
                 ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T, self.num_heads, 1)
