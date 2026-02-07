@@ -909,6 +909,29 @@ class AttnArgs:
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
+# Channel-group shift for shift-attention: shifts groups of channels in K and V
+# by different causal offsets. Same approach as ShiftAttention in train_fineweb_vanilla.py.
+SHIFT_OFFSETS = (0, 1, 2, 4)
+
+def _shift_kv(x: Tensor, shifts: tuple = SHIFT_OFFSETS) -> Tensor:
+    """Shift channel groups within each head along the time axis.
+    x: (B, T, H, D).  Group i gets shifted by shifts[i] positions causally.
+    Positions before the shift offset get zeros for that group.
+    torch.compile-friendly: static loop, simple slicing, no .item() calls.
+    """
+    head_dim = x.size(-1)
+    num_groups = len(shifts)
+    cpg = head_dim // num_groups  # channels per group
+
+    out = torch.zeros_like(x)
+    for i, s in enumerate(shifts):
+        sl = slice(i * cpg, (i + 1) * cpg)
+        if s == 0:
+            out[:, :, :, sl] = x[:, :, :, sl]
+        else:
+            out[:, s:, :, sl] = x[:, :-s, :, sl]
+    return out
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
         super().__init__()
@@ -926,7 +949,7 @@ class CausalSelfAttention(nn.Module):
         assert T % 16 == 0
         # unpack attention args
         yarn = attn_args.yarn
-        ve, sa_lambdas, key_offset = attn_args.ve, attn_args.sa_lambdas, attn_args.key_offset
+        ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
         seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
         # sparse gated attention to enable context based no-op by @classiclarryd
         # only include gates on layers with value embeds used on forward pass
@@ -940,9 +963,13 @@ class CausalSelfAttention(nn.Module):
         if not self.paired:
             q, k = yarn.rotary(q), yarn.rotary(k)
 
-            if key_offset:
-                # shift keys forward for the stationary head dims. Enables 1-layer induction.
-                k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:]
+            # Shift-attention: shift channel groups in K and V by different causal
+            # offsets (0,1,2,4). Each KV cache entry becomes a temporal chimera.
+            # Generalizes the original key_offset (which shifted only K, only half
+            # the channels, only by 1). Applied after RoPE so shifted channels
+            # retain their source-position encoding.
+            k = _shift_kv(k)
+            v = _shift_kv(v)
 
             if ve is not None:
                 ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T, self.num_heads, 1)
