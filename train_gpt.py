@@ -1145,7 +1145,15 @@ class GPT(nn.Module):
         )
         self.scalars.label = 'scalars'
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
+    def forward(
+        self,
+        input_seq: Tensor,
+        target_seq: Tensor,
+        seqlens: Tensor,
+        bigram_input_seq: Tensor,
+        schedule_cfg: ForwardScheduleConfig,
+        return_token_losses: bool = False,
+    ):
         assert input_seq.ndim == 1
 
         # unpack schedule_cfg
@@ -1240,6 +1248,8 @@ class GPT(nn.Module):
         if self.training:
             losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights, 23.0, 5.0, 7.5)
             loss = losses.sum()
+            if return_token_losses:
+                return loss, losses
         else:
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
             logits_for_loss = logits.float()
@@ -1810,6 +1820,8 @@ class Hyperparameters:
     geo_bigram_lambda_init: float = _env_float("GEO_BIGRAM_LAMBDA_INIT", 0.3125)
     mtp_objective_enable: bool = _env_bool("MTP_OBJECTIVE_ENABLE", True)
     mtp_objective_mode: str = os.environ.get("MTP_OBJECTIVE_MODE", "default")
+    hard_mining_stage3_enable: bool = _env_bool("HARD_MINING_STAGE3_ENABLE", False)
+    hard_mining_frac: float = _env_float("HARD_MINING_FRAC", 0.30)
 
 args = Hyperparameters()
 
@@ -1865,6 +1877,12 @@ class TrainingSchedule:
                 t = (step - start) / (end - start)
                 return self.stages[i], t
         return self.stages[-1], 1.0
+
+    def stage_index(self, step: int) -> int:
+        for i, (_, end) in enumerate(self.boundaries):
+            if step < end:
+                return i
+        return len(self.stages) - 1
 
     def get_lr(self, step: int) -> float:
         # learning rate schedule: tied to batch size schedule, with cooldown at the end
@@ -2108,6 +2126,10 @@ print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.ve
 print0(f"Running Triton version {triton.__version__}")
 print0(f"MTP objective enabled: {args.mtp_objective_enable}", console=True)
 print0(f"MTP objective mode: {args.mtp_objective_mode}", console=True)
+print0(
+    f"Hard mining stage3 enabled: {args.hard_mining_stage3_enable} frac={args.hard_mining_frac}",
+    console=True,
+)
 
 def nvidia_smi():
     import subprocess  # avoid top level import
@@ -2282,11 +2304,32 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     train_loss_step = 0.0
     train_loss_tok_step = 0.0
+    do_hard_mining = False
+    hard_keep = max(0.0, min(1.0, float(args.hard_mining_frac)))
+    if args.hard_mining_stage3_enable and hard_keep < 1.0:
+        # stage index 2 is the third scheduled stage (before extension)
+        do_hard_mining = (training_schedule.stage_index(step) == 2)
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(training_manager.train_loader_send_args)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
-        train_loss_step += float(loss.item())
-        train_loss_tok_step += float(loss.item()) / max(int(targets.numel()), 1)
+        if do_hard_mining:
+            loss_full, token_losses = model(
+                inputs,
+                targets,
+                cum_seqlens,
+                bigram_inputs,
+                training_manager.get_forward_args(),
+                return_token_losses=True,
+            )
+            k = max(1, int(token_losses.numel() * hard_keep))
+            hardest = torch.topk(token_losses, k=k, largest=True, sorted=False).values
+            loss = hardest.sum()
+            # log comparable full loss (before mining) for diagnostics
+            train_loss_step += float(loss_full.item())
+            train_loss_tok_step += float(loss_full.item()) / max(int(targets.numel()), 1)
+        else:
+            loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+            train_loss_step += float(loss.item())
+            train_loss_tok_step += float(loss.item()) / max(int(targets.numel()), 1)
         (loss * grad_scale).backward()
     train_loss_step /= grad_accum_steps
     train_loss_tok_step /= grad_accum_steps

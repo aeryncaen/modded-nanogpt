@@ -20,4 +20,8 @@ export GEO_PREBIAS_EMBED_LR_SCALE_INIT=1.0
 export GEO_PREBIAS_EMBED_LR_HOLD_STEPS=225
 export GEO_PREBIAS_EMBED_LR_RAMP_STEPS=75
 
+# Stage-3 hard mining: backprop only hardest token losses
+export HARD_MINING_STAGE3_ENABLE=1
+export HARD_MINING_FRAC=0.30
+
 exec torchrun --standalone --nproc_per_node=8 train_gpt.py "$@"
