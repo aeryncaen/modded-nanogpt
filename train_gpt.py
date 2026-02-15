@@ -990,9 +990,29 @@ class MLP(nn.Module):
         # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
         return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
 
+def feature_attention(h: Tensor, qkvo_w: Tensor, dim: int, n_features: int = 48):
+    """Feature attention: reshape hidden dims into (n_features, desc_dim) and self-attend.
+
+    Q=K from q_proj (first `dim` rows of qkvo_w), V = raw h.
+    Zero extra parameters — reuses Q weights from the attention bank.
+    """
+    desc_dim = dim // n_features
+    T = h.size(1)
+    # Q = K = q_proj(h), reshaped as features
+    q_feat = F.linear(h, qkvo_w[:dim].type_as(h)).view(T, n_features, desc_dim)
+    # V = raw h (no projection), reshaped as features
+    v_feat = h.view(T, n_features, desc_dim)
+    # Feature self-attention (Q=K, no causal mask)
+    scale = desc_dim ** -0.5
+    scores = torch.bmm(q_feat, q_feat.transpose(-2, -1)) * scale
+    weights = torch.softmax(scores, dim=-1)
+    feat_out = torch.bmm(weights, v_feat)
+    return F.silu(feat_out.view_as(h))
+
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool):
         super().__init__()
+        self.dim = dim
         # skip attention of blocks.6 (the 7th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, head_dim, num_heads, paired=use_paired_head) if has_attn else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
@@ -1000,6 +1020,10 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor = None, c_fc: Tensor = None, c_proj: Tensor = None):
         if self.attn is not None:
+            h = norm(x)
+            # Stage 1: Feature attention (organize features before sequence attention)
+            x = x + feature_attention(h, qkvo_w, self.dim)
+            # Stage 2: Sequence attention (tokens communicate with reorganized representations)
             x = x + self.attn(norm(x), attn_args, qkvo_w)
         if self.mlp is not None:
             x = x + self.mlp(norm(x), c_fc, c_proj)
