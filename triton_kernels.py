@@ -90,10 +90,10 @@ def XXT_kernel(
     c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
     tl.store(c_ptrs_t, output.T, mask=c_mask_t)
 
-def XXT(A: torch.Tensor, out: torch.Tensor):
-    """
-    Launch Triton kernel to compute C = A @ A.T
-    """
+def _launch_XXT(A: torch.Tensor, out: torch.Tensor,
+                BLOCK_SIZE_M: int, BLOCK_SIZE_N: int, BLOCK_SIZE_K: int,
+                num_stages: int = 4, num_warps: int = 4):
+    """Helper to launch XXT_kernel with caller-specified block sizes."""
     assert A.ndim == 2 or A.ndim == 3
     M, K = A.shape[-2:]
     assert out.size(-2) == M, "Output matrix has incorrect shape"
@@ -102,14 +102,6 @@ def XXT(A: torch.Tensor, out: torch.Tensor):
     batch_size = A.size(0) if A.ndim == 3 else 1
     input_batch_stride = A.stride(0) if A.ndim == 3 else 0
     output_batch_stride = out.stride(0) if out.ndim == 3 else 0
-
-    # Hardcoded configs based on H100 autotuning
-    if K == 768:
-        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
-        num_stages, num_warps = 4, 4
-    else:
-        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 128, 128
-        num_stages, num_warps = 4, 4
 
     grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
     XXT_kernel[grid](
@@ -132,6 +124,18 @@ def XXT(A: torch.Tensor, out: torch.Tensor):
         num_warps=num_warps,
     )
     return out
+
+def XXT(A: torch.Tensor, out: torch.Tensor):
+    """Launch XXT kernel with configs tuned for large matrices (M=768, K=768)."""
+    M, K = A.shape[-2:]
+    if K == 768:
+        return _launch_XXT(A, out, 128, 128, 64)
+    else:
+        return _launch_XXT(A, out, 64, 128, 128)
+
+def XXT_small(A: torch.Tensor, out: torch.Tensor):
+    """Launch XXT kernel with configs tuned for feature attention (M=48, K=16)."""
+    return _launch_XXT(A, out, 16, 16, 16, num_stages=1, num_warps=1)
 
 @triton.jit
 def ba_plus_cAA_kernel(

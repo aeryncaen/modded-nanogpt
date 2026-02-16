@@ -34,7 +34,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
+from triton_kernels import XXT, XXT_small, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
 
 dynamo.config.recompile_limit = 64
 
@@ -995,6 +995,7 @@ def feature_attention(h: Tensor, qkvo_w: Tensor, dim: int, n_features: int = 48)
 
     Q=K from q_proj (first `dim` rows of qkvo_w), V = raw h.
     Zero extra parameters — reuses Q weights from the attention bank.
+    Uses XXT_small triton kernel for the Q=K symmetric matmul.
     """
     desc_dim = dim // n_features
     T = h.size(1)
@@ -1004,7 +1005,9 @@ def feature_attention(h: Tensor, qkvo_w: Tensor, dim: int, n_features: int = 48)
     v_feat = h.view(T, n_features, desc_dim)
     # Feature self-attention (Q=K, no causal mask)
     scale = desc_dim ** -0.5
-    scores = torch.bmm(q_feat, q_feat.transpose(-2, -1)) * scale
+    scores = torch.empty(T, n_features, n_features, device=h.device, dtype=h.dtype)
+    XXT_small(q_feat, scores)
+    scores *= scale
     weights = torch.softmax(scores, dim=-1)
     feat_out = torch.bmm(weights, v_feat)
     return F.silu(feat_out.view_as(h))
