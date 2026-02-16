@@ -932,7 +932,11 @@ class CausalSelfAttention(nn.Module):
         # only include gates on layers with value embeds used on forward pass
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
 
-        q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        qkv = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x))
+        q, k, v = qkv.view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+
+        # Feature attention: Q=K from Q portion of fused QKV, V = raw x (norm'd input)
+        feat_out = feature_attention(qkv[..., :self.dim], x)
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
@@ -977,7 +981,7 @@ class CausalSelfAttention(nn.Module):
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
-        return y
+        return feat_out, y
 
 class MLP(nn.Module):
     def __init__(self):
@@ -990,22 +994,24 @@ class MLP(nn.Module):
         # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
         return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
 
-def feature_attention(h: Tensor, qkvo_w: Tensor, dim: int, n_features: int = 48):
-    """Feature attention: reshape hidden dims into (n_features, desc_dim) and self-attend.
+N_FEATURES = 48
+DESC_DIM = 768 // N_FEATURES  # 16
 
-    Q=K from q_proj (first `dim` rows of qkvo_w), V = raw h.
-    Zero extra parameters — reuses Q weights from the attention bank.
-    Uses XXT_small triton kernel for the Q=K symmetric matmul.
+def feature_attention(q: Tensor, h: Tensor):
+    """Feature attention on pre-computed Q and raw h. No extra matmuls.
+
+    q: (B, T, dim) — already projected by QKV linear
+    h: (B, T, dim) — raw norm(x), used as V
+    Returns feat_out same shape as h.
     """
-    desc_dim = dim // n_features
     T = h.size(1)
-    # Q = K = q_proj(h), reshaped as features
-    q_feat = F.linear(h, qkvo_w[:dim].type_as(h)).view(T, n_features, desc_dim)
-    # V = raw h (no projection), reshaped as features
-    v_feat = h.view(T, n_features, desc_dim)
+    # Q=K: reshape projected Q as features
+    q_feat = q.view(T, N_FEATURES, DESC_DIM)
+    # V = raw h (no projection)
+    v_feat = h.view(T, N_FEATURES, DESC_DIM)
     # Feature self-attention (Q=K, no causal mask)
-    scale = desc_dim ** -0.5
-    scores = torch.empty(T, n_features, n_features, device=h.device, dtype=h.dtype)
+    scale = DESC_DIM ** -0.5
+    scores = torch.empty(T, N_FEATURES, N_FEATURES, device=h.device, dtype=h.dtype)
     XXT_small(q_feat, scores)
     scores *= scale
     weights = torch.softmax(scores, dim=-1)
@@ -1023,11 +1029,8 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor = None, c_fc: Tensor = None, c_proj: Tensor = None):
         if self.attn is not None:
-            h = norm(x)
-            # Stage 1: Feature attention (organize features before sequence attention)
-            x = x + feature_attention(h, qkvo_w, self.dim)
-            # Stage 2: Sequence attention (tokens communicate with reorganized representations)
-            x = x + self.attn(norm(x), attn_args, qkvo_w)
+            feat_out, seq_out = self.attn(norm(x), attn_args, qkvo_w)
+            x = x + feat_out + seq_out
         if self.mlp is not None:
             x = x + self.mlp(norm(x), c_fc, c_proj)
         return x
