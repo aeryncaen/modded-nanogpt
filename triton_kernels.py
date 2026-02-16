@@ -90,10 +90,11 @@ def XXT_kernel(
     c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
     tl.store(c_ptrs_t, output.T, mask=c_mask_t)
 
-def _launch_XXT(A: torch.Tensor, out: torch.Tensor,
-                BLOCK_SIZE_M: int, BLOCK_SIZE_N: int, BLOCK_SIZE_K: int,
-                num_stages: int = 4, num_warps: int = 4):
-    """Helper to launch XXT_kernel with caller-specified block sizes."""
+def XXT(A: torch.Tensor, out: torch.Tensor):
+    """
+    Launch Triton kernel to compute C = A @ A.T
+    Tuned for large matrices (M=768, K=768).
+    """
     assert A.ndim == 2 or A.ndim == 3
     M, K = A.shape[-2:]
     assert out.size(-2) == M, "Output matrix has incorrect shape"
@@ -102,6 +103,14 @@ def _launch_XXT(A: torch.Tensor, out: torch.Tensor,
     batch_size = A.size(0) if A.ndim == 3 else 1
     input_batch_stride = A.stride(0) if A.ndim == 3 else 0
     output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    # Hardcoded configs based on H100 autotuning
+    if K == 768:
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
+        num_stages, num_warps = 4, 4
+    else:
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 128, 128
+        num_stages, num_warps = 4, 4
 
     grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
     XXT_kernel[grid](
@@ -125,17 +134,66 @@ def _launch_XXT(A: torch.Tensor, out: torch.Tensor,
     )
     return out
 
-def XXT(A: torch.Tensor, out: torch.Tensor):
-    """Launch XXT kernel with configs tuned for large matrices (M=768, K=768)."""
-    M, K = A.shape[-2:]
-    if K == 768:
-        return _launch_XXT(A, out, 128, 128, 64)
-    else:
-        return _launch_XXT(A, out, 64, 128, 128)
+@triton.jit
+def XXT_small_kernel(
+    A_ptr, C_ptr,
+    M, K,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+):
+    """XXT kernel tuned for feature attention: M=48, K=16.
+    Block sizes hardcoded as constants — single block covers entire matrix.
+    """
+    BLOCK_SIZE_M: tl.constexpr = 64  # next power of 2 >= 48
+    BLOCK_SIZE_N: tl.constexpr = 64
+    BLOCK_SIZE_K: tl.constexpr = 16
+
+    pid = tl.program_id(axis=0)
+    batch_idx = pid  # one program per batch element
+
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    # Load entire A block (M x K) — no loop needed since BLOCK_SIZE_K >= K
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
+
+    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
+    at = tl.load(at_ptrs, mask=(offs_k[:, None] < K) & (offs_n[None, :] < M), other=0.0)
+
+    output = tl.dot(a, at).to(C_ptr.dtype.element_ty)
+
+    # Store full result
+    c_ptrs = C_ptr + (offs_m[:, None] * c_stride_r + offs_n[None, :] * c_stride_c)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < M)
+    tl.store(c_ptrs, output, mask=c_mask)
 
 def XXT_small(A: torch.Tensor, out: torch.Tensor):
-    """Launch XXT kernel with configs tuned for feature attention (M=48, K=16)."""
-    return _launch_XXT(A, out, 16, 16, 16, num_stages=1, num_warps=1)
+    """Launch XXT_small_kernel for feature attention (M=48, K=16). One block per batch element."""
+    assert A.ndim == 2 or A.ndim == 3
+    M, K = A.shape[-2:]
+    assert out.size(-2) == M and out.size(-1) == M
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    grid = (batch_size,)
+    XXT_small_kernel[grid](
+        A_ptr=A, C_ptr=out, M=M, K=K,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        num_warps=1,
+        num_stages=1,
+    )
 
 @triton.jit
 def ba_plus_cAA_kernel(
