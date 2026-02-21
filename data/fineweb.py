@@ -73,8 +73,15 @@ os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 # download the dataset
 fw = load_dataset("HuggingFaceFW/fineweb", name=remote_name, split="train")
 
-# init the tokenizer
-enc = tiktoken.get_encoding("gpt2")
+# init the tokenizer — drop all tokens over 16 bytes (junk: mojibake, separator lines, etc.)
+enc_base = tiktoken.get_encoding("gpt2")
+trimmed_ranks = {k: v for k, v in enc_base._mergeable_ranks.items() if len(k) <= 16}
+enc = tiktoken.Encoding(
+    name="gpt2_trimmed",
+    pat_str=enc_base._pat_str,
+    mergeable_ranks=trimmed_ranks,
+    special_tokens=enc_base._special_tokens,
+)
 eot = enc._special_tokens['<|endoftext|>'] # end of text token
 def tokenize(doc):
     # tokenizes a single document and returns a numpy array of uint16 tokens

@@ -327,10 +327,7 @@ class NorMuonAndAdam:
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
 
-        # Embed/lm_head tying state
-        self.split_embed = False
-        self._lm_head_param = self._param_by_label.get("lm_head")
-        self._embed_param = self._param_by_label.get("embed")
+
 
     def _build_param_cfg(self, param: nn.Parameter, label: str):
         """Build config for a single parameter from param_table."""
@@ -495,53 +492,13 @@ class NorMuonAndAdam:
     # State management
 
     def reset(self):
-        """Reset NorMuon momentum buffers and split_embed state (called on training reset)."""
-        self.split_embed = False
+        """Reset NorMuon momentum buffers (called on training reset)."""
         for param, p_cfg in self.param_cfgs.items():
             if p_cfg.optim == "normuon":
                 p_state = self.param_states[param]
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
                 p_state["second_momentum_buffer"].zero_()
-
-    def copy_lm_state_to_embed(self):
-        """
-        Copy the optimizer state from the lm_head to the embed at the untie point.
-        This requires an all-gather + reshard because of different sharding:
-        - lm_head (768, 50304) is sharded to (96, 50304) per rank (along model_dim)
-        - embed (50304, 768) is sharded to (6288, 768) per rank (along vocab_size)
-
-        We all-gather the lm_head momentum, transpose it, then each rank takes their
-        embed shard to get the correct momentum state.
-        """
-        lm_head = self._lm_head_param
-        embed = self._embed_param
-        lm_state = self.param_states[lm_head]
-        embed_state = self.param_states[embed]
-        lm_cfg = self.param_cfgs[lm_head]
-        embed_cfg = self.param_cfgs[embed]
-
-        embed_state['step'] = lm_state['step'] # Preserve step count for bias correction
-
-        # Copy optimizer state with all-gather + transpose + reshard
-        if self.world_size > 1:
-            rank = dist.get_rank()
-            lm_chunk_size = lm_cfg.chunk_size  # 96
-            embed_chunk_size = embed_cfg.chunk_size  # 6288
-
-            # All-gather lm_head momentum to get full (768, 50304) tensor
-            for key in ["exp_avg", "exp_avg_sq"]:
-                lm_chunk = lm_state[key]  # (96, 50304)
-                full_lm = torch.empty(lm_head.shape[0], lm_head.shape[1], dtype=lm_chunk.dtype, device=lm_chunk.device)
-                dist.all_gather_into_tensor(full_lm, lm_chunk.contiguous())
-                embed_state[key].copy_(full_lm.T[rank * embed_chunk_size:(rank + 1) * embed_chunk_size])
-        else:
-            # Single GPU: simple transpose
-            for key in ["exp_avg", "exp_avg_sq"]:
-                embed_state[key].copy_(lm_state[key].T)
-
-        # Mark as split
-        self.split_embed = True
 
     def state_dict(self):
         """Return the optimizer state as a dict."""
@@ -584,13 +541,8 @@ class NorMuonAndAdam:
            - Wait for reduce, compute update, launch gather
         3. Finalize phase: Wait for gathers
 
-        While the embeddings are tied:
-        - Comms and update math are only done on lm_head.
-        - We add embed.grad.T into lm_head.grad before comms.
-        - After lm_head gather, we copy lm_head.data.T --> embed.data
         """
         rank = dist.get_rank() if dist.is_initialized() else 0
-        lm_param, embed_param = self._lm_head_param, self._embed_param
 
         # ===== Phase 1: Launch reduces in scatter_order =====
         for label in self.scatter_order:
@@ -602,20 +554,10 @@ class NorMuonAndAdam:
             if param.grad is None:
                 continue
 
-            # lm_head when tied: aggregate embed.grad.T (transposed shapes)
-            if label == "lm_head" and do_adam and not self.split_embed:
-                if embed_param is not None and embed_param.grad is not None:
-                    param.grad.add_(embed_param.grad.T)
-
-            # Skip embed when tied (copied from lm_head after gather)
-            if label == "embed" and not self.split_embed:
-                continue
-
             self._launch_reduce(param, param.grad)
 
         # ===== Phase 2: Process updates in work_order =====
         gather_futures = []
-        lm_head_gather_future = None
 
         for label in self.work_order:
             param = self._param_by_label[label]
@@ -637,21 +579,9 @@ class NorMuonAndAdam:
             # Launch gather for sharded params
             if p_cfg.comms == "sharded" and self.world_size > 1:
                 gather_fut = self._launch_gather(param, p_slice)
-                if label == "lm_head":
-                    lm_head_gather_future = gather_fut
-                else:
-                    gather_futures.append(gather_fut)
+                gather_futures.append(gather_fut)
 
-        # ===== Phase 3: Wait for gathers, sync embed if tied =====
-        # Wait for lm_head gather first so we can copy to embed while other gathers complete
-        if lm_head_gather_future is not None:
-            lm_head_gather_future.wait()
-
-        # When tied: copy lm_head.T to embed
-        if do_adam and not self.split_embed and embed_param is not None and lm_param is not None:
-            embed_param.data.copy_(lm_param.data.T)
-
-        # Wait for remaining gathers
+        # ===== Phase 3: Wait for gathers =====
         for fut in gather_futures:
             fut.wait()
 
@@ -1011,6 +941,92 @@ class Block(nn.Module):
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
+# -----------------------------------------------------------------------------
+# Composite Embedding: factored byte-level representation for BPE tokens
+# Instead of learning one vector per token (V * d params), we decompose each
+# token into its constituent bytes and learn embeddings per byte value (256)
+# plus per-position-within-token (max_bytes). A token's embedding is the
+# concatenation of (byte_embed + position_embed) for each byte slot.
+
+def _build_token_byte_table(vocab_size: int, max_bytes: int = 16, pad_idx: int = 256):
+    """Build a lookup table mapping each token ID to its byte sequence, padded to max_bytes."""
+    import tiktoken
+    enc = tiktoken.get_encoding("gpt2")
+    table = torch.full((vocab_size, max_bytes), pad_idx, dtype=torch.long)
+    for i in range(min(vocab_size, enc.n_vocab)):
+        try:
+            b = enc.decode_single_token_bytes(i)
+            if len(b) <= max_bytes:
+                for j, byte_val in enumerate(b):
+                    table[i, j] = byte_val
+            # tokens over max_bytes should not exist in the trimmed tokenizer
+        except Exception:
+            pass  # special tokens / gaps get all-pad (scratch space)
+    return table
+
+class CompositeEmbedding(nn.Module):
+    """
+    Factored embedding: each BPE token is represented by concatenating learned
+    descriptors for each of its constituent bytes.
+
+    For max_bytes=16, byte_dim=32, pos_dim=16:
+      - byte_embed: nn.Embedding(257, 32)   -- 256 byte values + 1 pad
+      - pos_embed:  nn.Embedding(16, 16)    -- per-position-within-token
+      - per slot: 32 + 16 = 48 dims
+      - total: 16 * 48 = 768 = model_dim
+    """
+    def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.model_dim = model_dim
+        self.max_bytes = max_bytes
+        self.pad_idx = 256  # index for pad byte
+
+        dims_per_slot = model_dim // max_bytes  # 48
+        assert model_dim % max_bytes == 0, f"model_dim ({model_dim}) must be divisible by max_bytes ({max_bytes})"
+        self.byte_dim = dims_per_slot * 2 // 3  # 32
+        self.pos_dim = dims_per_slot - self.byte_dim  # 16
+
+        self.byte_embed = nn.Embedding(257, self.byte_dim)  # 256 bytes + pad
+        self.pos_embed = nn.Embedding(max_bytes, self.pos_dim)
+
+        # Fixed lookup table: token_id -> byte sequence (padded)
+        # Registered as buffer so it moves to device with the model
+        self.register_buffer('token_bytes', _build_token_byte_table(vocab_size, max_bytes, self.pad_idx), persistent=False)
+        # Fixed position indices [0, 1, ..., max_bytes-1]
+        self.register_buffer('pos_indices', torch.arange(max_bytes), persistent=False)
+
+        # Init
+        nn.init.normal_(self.byte_embed.weight, mean=0, std=0.02)
+        nn.init.normal_(self.pos_embed.weight, mean=0, std=0.02)
+
+        # Labels for optimizer
+        self.byte_embed.weight.label = 'byte_embed'
+        self.pos_embed.weight.label = 'pos_embed'
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        """
+        Args:
+            token_ids: (T,) token indices
+        Returns:
+            (T, model_dim) composite embeddings
+        """
+        byte_seqs = self.token_bytes[token_ids]       # (T, max_bytes)
+        b_emb = self.byte_embed(byte_seqs)             # (T, max_bytes, byte_dim)
+        p_emb = self.pos_embed(self.pos_indices)       # (max_bytes, pos_dim)
+        slot_emb = torch.cat([b_emb, p_emb.expand(byte_seqs.size(0), -1, -1)], dim=-1)  # (T, max_bytes, dims_per_slot)
+        return slot_emb.reshape(token_ids.size(0), self.model_dim)  # (T, model_dim)
+
+    def embed_all(self) -> Tensor:
+        """
+        Compute embeddings for all tokens in vocab. Used for weight-tied lm_head.
+        Returns: (vocab_size, model_dim)
+        """
+        b_emb = self.byte_embed(self.token_bytes)       # (V, max_bytes, byte_dim)
+        p_emb = self.pos_embed(self.pos_indices)         # (max_bytes, pos_dim)
+        slot_emb = torch.cat([b_emb, p_emb.expand(self.vocab_size, -1, -1)], dim=-1)
+        return slot_emb.reshape(self.vocab_size, self.model_dim)
+
 @dataclass
 class ForwardScheduleConfig:
     mtp_weights: torch.Tensor
@@ -1105,10 +1121,7 @@ class GPT(nn.Module):
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
         self.lm_head.weight.label = 'lm_head'
 
-        self.embed = nn.Embedding(self.vocab_size, model_dim)
-        self.embed.weight.label = 'embed'
-        with torch.no_grad():
-            self.embed.weight.copy_(self.lm_head.weight.T)
+        self.embed = CompositeEmbedding(self.vocab_size, model_dim)
 
         self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
         self.bigram_embed.weight.label = 'bigram_embed'
@@ -1178,7 +1191,7 @@ class GPT(nn.Module):
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
 
-        # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
+        # Composite embedding lookup - factored byte-level representation
         x = self.embed(input_seq)
         
         bigram_seq = self._compute_bigram_hash(input_seq)
@@ -1455,13 +1468,12 @@ class TrainingSchedule:
         1. Multi Token Prediction schedule of [1, 0.5, 0.25->0] -> [1, 0.5->0] -> [1] @varunneal
         2. Sliding Attention window schedule of [1,3] -> [3,7] -> [5,11] -> [6,13]
         3. YaRN updates to RoPE on window changes
-        4. Split embed and lm head at 2/3 of training
-        5. Batch size schedule of 8 -> 16 -> 24
-        6. Post training extension of long windows from 13 to 20
+        4. Batch size schedule of 8 -> 16 -> 24
+        5. Post training extension of long windows from 13 to 20
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
-                 cooldown_frac: float = 0.5, split_embed_stage: int = 2, ws_post_yarn_ext: int = 20):
+                 cooldown_frac: float = 0.5, ws_post_yarn_ext: int = 20):
         self.stages = stages
         self.scheduled_iterations = scheduled_iterations
         self.cooldown_frac = cooldown_frac
@@ -1474,9 +1486,6 @@ class TrainingSchedule:
         ends = [0] + [round(c * scheduled_iterations) for c in accumulate(s.duration for s in stages[:-1])] + [self.total_steps]
         assert self.scheduled_iterations == ends[-2]
         self.boundaries = list(pairwise(ends))
-
-        # Split embed at specified stage (ensure odd step for Adam)
-        self.split_step = self.boundaries[split_embed_stage][0] | 1
 
         # Precompute MTP weights for all steps
         self.mtp_weights = []
@@ -1540,7 +1549,6 @@ class TrainingManager():
         3. Explicit scatter_order and work_order for communication scheduling (no backward hooks)
         4. Muon has a linear momentum warmup and cooldown schedule
         5. Learning rates follow a linear decay schedule
-        6. Embed is tied to lm_head until split step (2/3 of training), then untied @classiclarryd
     """
     def __init__(self, model):
         self.model = model
@@ -1553,6 +1561,8 @@ class TrainingManager():
             "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "byte_embed":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "pos_embed":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
@@ -1561,16 +1571,15 @@ class TrainingManager():
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
-            "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
         # - Process smaller/faster params first while large reduces complete
-        # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
+            "byte_embed", "pos_embed",  # Composite embedding (tiny)
             "value_embed", "bigram_embed",  # Medium
-            "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
-            "attn", "mlp",        # Large, polar express - process last to maximize overlap
+            "lm_head",               # Large
+            "attn", "mlp",           # Large, polar express - process last to maximize overlap
         ]
 
         adam_defaults = dict(
@@ -1594,9 +1603,6 @@ class TrainingManager():
             adam_defaults=adam_defaults,
             normuon_defaults=normuon_defaults,
         )
-
-        # Split embed from lm_head at 2/3 of training (on an odd step so Adam updates)
-        self.split_step = training_schedule.split_step
 
         self.reset()
 
@@ -1648,15 +1654,11 @@ class TrainingManager():
         # Step optimizer with do_adam flag
         self.optimizer.step(do_adam=do_adam)
 
-        # At split step: copy lm_head optimizer state to embed and mark as split
-        if step == self.split_step:
-            self.optimizer.copy_lm_state_to_embed()
-
     def reset(self, state=None):
         if state is not None:
             self.optimizer.load_state_dict(state)
 
-        # Reset NorMuon momentum buffers and split_embed state
+        # Reset NorMuon momentum buffers
         self.optimizer.reset()
 
         stage, _ = training_schedule.lookup(0)
