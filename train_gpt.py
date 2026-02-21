@@ -968,16 +968,11 @@ class CompositeEmbedding(nn.Module):
     Factored embedding: each BPE token is represented by concatenating learned
     descriptors for each of its constituent bytes.
 
-    Per byte slot: 40 shared (from byte value) + 8 per-token = 48
-    16 slots * 48 = 768 = model_dim
-
-    Params:
-      - byte_embed:  nn.Embedding(257, 40)           -- 10,280 shared
-      - token_embed: nn.Embedding(vocab_size, 128)   -- 6,438,912 per-token (16 * 8 = 128)
+    For max_bytes=16, model_dim=768:
+      - byte_embed: nn.Embedding(257, 48)  -- 256 byte values + 1 pad
+      - 16 slots * 48 = 768
+      - total: 257 * 48 = 12,336 params
     """
-    SHARED_PER_BYTE = 40
-    TOKEN_PER_BYTE = 8
-
     def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16):
         super().__init__()
         self.vocab_size = vocab_size
@@ -987,31 +982,22 @@ class CompositeEmbedding(nn.Module):
 
         self.dims_per_slot = model_dim // max_bytes  # 48
         assert model_dim % max_bytes == 0
-        assert self.dims_per_slot == self.SHARED_PER_BYTE + self.TOKEN_PER_BYTE
 
-        self.byte_embed = nn.Embedding(257, self.SHARED_PER_BYTE)   # 256 bytes + pad
-        self.token_embed = nn.Embedding(vocab_size, max_bytes * self.TOKEN_PER_BYTE)  # 128 params per token
+        self.byte_embed = nn.Embedding(257, self.dims_per_slot)  # 256 bytes + pad
 
         self.register_buffer('token_bytes', _build_token_byte_table(vocab_size, max_bytes, self.pad_idx), persistent=False)
 
         nn.init.normal_(self.byte_embed.weight, mean=0, std=0.02)
-        nn.init.normal_(self.token_embed.weight, mean=0, std=0.02)
         self.byte_embed.weight.label = 'byte_embed'
-        self.token_embed.weight.label = 'token_embed'
 
     def forward(self, token_ids: Tensor) -> Tensor:
-        byte_seqs = self.token_bytes[token_ids]                     # (T, 16)
-        shared = self.byte_embed(byte_seqs)                         # (T, 16, 40)
-        per_tok = self.token_embed(token_ids)                       # (T, 128)
-        per_tok = per_tok.view(token_ids.size(0), self.max_bytes, self.TOKEN_PER_BYTE)  # (T, 16, 8)
-        slot_emb = torch.cat([shared, per_tok], dim=-1)             # (T, 16, 48)
-        return slot_emb.reshape(token_ids.size(0), self.model_dim)  # (T, 768)
+        byte_seqs = self.token_bytes[token_ids]        # (T, 16)
+        b_emb = self.byte_embed(byte_seqs)              # (T, 16, 48)
+        return b_emb.reshape(token_ids.size(0), self.model_dim)  # (T, 768)
 
     def embed_all(self) -> Tensor:
-        shared = self.byte_embed(self.token_bytes)                  # (V, 16, 40)
-        per_tok = self.token_embed.weight.view(self.vocab_size, self.max_bytes, self.TOKEN_PER_BYTE)  # (V, 16, 8)
-        slot_emb = torch.cat([shared, per_tok], dim=-1)             # (V, 16, 48)
-        return slot_emb.reshape(self.vocab_size, self.model_dim)
+        b_emb = self.byte_embed(self.token_bytes)       # (V, 16, 48)
+        return b_emb.reshape(self.vocab_size, self.model_dim)
 
 @dataclass
 class ForwardScheduleConfig:
@@ -1035,8 +1021,11 @@ class GPT(nn.Module):
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        self.value_embeds = nn.Parameter(torch.zeros(5 * self.vocab_size, model_dim, dtype=torch.bfloat16))
-        self.value_embeds.label = 'value_embed'
+        # Factored as composite byte-level embeddings (5 * 12,336 = 61,680 params vs 193M)
+        self.value_embeds = nn.ModuleList([CompositeEmbedding(self.vocab_size, model_dim) for _ in range(5)])
+        for i, ve in enumerate(self.value_embeds):
+            nn.init.zeros_(ve.byte_embed.weight)
+            ve.byte_embed.weight.label = f've{i}_byte_embed'
 
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
@@ -1183,8 +1172,8 @@ class GPT(nn.Module):
         bigram_seq = self._compute_bigram_hash(input_seq)
         x0_bigram = self.bigram_embed(bigram_seq)[None]
 
-        # Value embeddings - always computed (not precomputed)
-        ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
+        # Value embeddings - composite byte-level factored
+        ve = [self.value_embeds[i](input_seq) for i in range(5)]
         # 01 ... 234 structure on token value embeddings by @photomz
         ve = [ve[0], ve[1]] + [None] * (self.num_layers - 5) + [ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
@@ -1548,8 +1537,7 @@ class TrainingManager():
             "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "byte_embed":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "token_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            **{f've{i}_byte_embed': {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
@@ -1562,8 +1550,9 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "byte_embed", "token_embed",  # Composite embedding
-            "value_embed", "bigram_embed",  # Medium
+            "byte_embed",  # Composite embedding
+            *[f've{i}_byte_embed' for i in range(5)],  # Composite value embeddings
+            "bigram_embed",  # Medium
             "lm_head",               # Large
             "attn", "mlp",           # Large, polar express - process last to maximize overlap
         ]
