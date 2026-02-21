@@ -944,9 +944,9 @@ def next_multiple_of_n(v: float | int, *, n: int):
 # -----------------------------------------------------------------------------
 # Composite Embedding: factored byte-level representation for BPE tokens
 # Instead of learning one vector per token (V * d params), we decompose each
-# token into its constituent bytes and learn embeddings per byte value (256)
-# plus per-position-within-token (max_bytes). A token's embedding is the
-# concatenation of (byte_embed + position_embed) for each byte slot.
+# Composite embedding: decompose each BPE token into its constituent bytes
+# and learn a shared embedding per byte value. A token's embedding is the
+# concatenation of byte embeddings across its byte slots.
 
 def _build_token_byte_table(vocab_size: int, max_bytes: int = 16, pad_idx: int = 256):
     """Build a lookup table mapping each token ID to its byte sequence, padded to max_bytes."""
@@ -959,9 +959,8 @@ def _build_token_byte_table(vocab_size: int, max_bytes: int = 16, pad_idx: int =
             if len(b) <= max_bytes:
                 for j, byte_val in enumerate(b):
                     table[i, j] = byte_val
-            # tokens over max_bytes should not exist in the trimmed tokenizer
         except Exception:
-            pass  # special tokens / gaps get all-pad (scratch space)
+            pass  # special tokens / gaps get all-pad
     return table
 
 class CompositeEmbedding(nn.Module):
@@ -969,63 +968,36 @@ class CompositeEmbedding(nn.Module):
     Factored embedding: each BPE token is represented by concatenating learned
     descriptors for each of its constituent bytes.
 
-    For max_bytes=16, byte_dim=32, pos_dim=16:
-      - byte_embed: nn.Embedding(257, 32)   -- 256 byte values + 1 pad
-      - pos_embed:  nn.Embedding(16, 16)    -- per-position-within-token
-      - per slot: 32 + 16 = 48 dims
-      - total: 16 * 48 = 768 = model_dim
+    For max_bytes=16, model_dim=768:
+      - byte_embed: nn.Embedding(257, 48)  -- 256 byte values + 1 pad
+      - dims_per_slot = 768 / 16 = 48
+      - total: 257 * 48 = 12,336 params
     """
     def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16):
         super().__init__()
         self.vocab_size = vocab_size
         self.model_dim = model_dim
         self.max_bytes = max_bytes
-        self.pad_idx = 256  # index for pad byte
+        self.pad_idx = 256
 
-        dims_per_slot = model_dim // max_bytes  # 48
+        self.dims_per_slot = model_dim // max_bytes  # 48
         assert model_dim % max_bytes == 0, f"model_dim ({model_dim}) must be divisible by max_bytes ({max_bytes})"
-        self.byte_dim = dims_per_slot * 2 // 3  # 32
-        self.pos_dim = dims_per_slot - self.byte_dim  # 16
 
-        self.byte_embed = nn.Embedding(257, self.byte_dim)  # 256 bytes + pad
-        self.pos_embed = nn.Embedding(max_bytes, self.pos_dim)
+        self.byte_embed = nn.Embedding(257, self.dims_per_slot)  # 256 bytes + pad
 
-        # Fixed lookup table: token_id -> byte sequence (padded)
-        # Registered as buffer so it moves to device with the model
         self.register_buffer('token_bytes', _build_token_byte_table(vocab_size, max_bytes, self.pad_idx), persistent=False)
-        # Fixed position indices [0, 1, ..., max_bytes-1]
-        self.register_buffer('pos_indices', torch.arange(max_bytes), persistent=False)
 
-        # Init
         nn.init.normal_(self.byte_embed.weight, mean=0, std=0.02)
-        nn.init.normal_(self.pos_embed.weight, mean=0, std=0.02)
-
-        # Labels for optimizer
         self.byte_embed.weight.label = 'byte_embed'
-        self.pos_embed.weight.label = 'pos_embed'
 
     def forward(self, token_ids: Tensor) -> Tensor:
-        """
-        Args:
-            token_ids: (T,) token indices
-        Returns:
-            (T, model_dim) composite embeddings
-        """
-        byte_seqs = self.token_bytes[token_ids]       # (T, max_bytes)
-        b_emb = self.byte_embed(byte_seqs)             # (T, max_bytes, byte_dim)
-        p_emb = self.pos_embed(self.pos_indices)       # (max_bytes, pos_dim)
-        slot_emb = torch.cat([b_emb, p_emb.expand(byte_seqs.size(0), -1, -1)], dim=-1)  # (T, max_bytes, dims_per_slot)
-        return slot_emb.reshape(token_ids.size(0), self.model_dim)  # (T, model_dim)
+        byte_seqs = self.token_bytes[token_ids]        # (T, max_bytes)
+        b_emb = self.byte_embed(byte_seqs)              # (T, max_bytes, dims_per_slot)
+        return b_emb.reshape(token_ids.size(0), self.model_dim)  # (T, model_dim)
 
     def embed_all(self) -> Tensor:
-        """
-        Compute embeddings for all tokens in vocab. Used for weight-tied lm_head.
-        Returns: (vocab_size, model_dim)
-        """
-        b_emb = self.byte_embed(self.token_bytes)       # (V, max_bytes, byte_dim)
-        p_emb = self.pos_embed(self.pos_indices)         # (max_bytes, pos_dim)
-        slot_emb = torch.cat([b_emb, p_emb.expand(self.vocab_size, -1, -1)], dim=-1)
-        return slot_emb.reshape(self.vocab_size, self.model_dim)
+        b_emb = self.byte_embed(self.token_bytes)       # (V, max_bytes, dims_per_slot)
+        return b_emb.reshape(self.vocab_size, self.model_dim)
 
 @dataclass
 class ForwardScheduleConfig:
@@ -1562,7 +1534,6 @@ class TrainingManager():
             "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "byte_embed":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "pos_embed":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
@@ -1576,7 +1547,7 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "byte_embed", "pos_embed",  # Composite embedding (tiny)
+            "byte_embed",  # Composite embedding (tiny)
             "value_embed", "bigram_embed",  # Medium
             "lm_head",               # Large
             "attn", "mlp",           # Large, polar express - process last to maximize overlap
