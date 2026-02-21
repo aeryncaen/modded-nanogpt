@@ -965,44 +965,46 @@ def _build_token_byte_table(vocab_size: int, max_bytes: int = 16, pad_idx: int =
 
 class CompositeEmbedding(nn.Module):
     """
-    Factored embedding: shared byte descriptors + per-token low-rank adapter.
+    Factored embedding: shared byte params + per-token params + LoRA adapter.
 
-    Base: byte_embed(257, dims_per_slot) looked up per byte slot, reshaped to model_dim.
-    Adapter: token_down(vocab_size, rank) -> token_up(rank, model_dim).
-    Output = base + adapter.
+    Per byte slot: 40 shared (from byte value) + 8 per-token = 48
+    16 slots * 48 = 768 = model_dim
+    LoRA: token_down(vocab_size, rank) -> token_up(rank, model_dim), added in full model_dim space.
 
     prefix: prepended to parameter labels for optimizer config namespacing.
     """
+    SHARED_PER_BYTE = 40
+    TOKEN_PER_BYTE = 8
+
     def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16,
-                 rank: int = 64, prefix: str = '',
-                 byte_init_std: float = 0.02, adapter_init_std: float = 0.02):
+                 rank: int = 16, prefix: str = '',
+                 byte_init_std: float = 0.02, token_init_std: float = 0.02,
+                 adapter_init_std: float = 0.02):
         super().__init__()
         self.vocab_size = vocab_size
         self.model_dim = model_dim
         self.max_bytes = max_bytes
         self.pad_idx = 256
 
-        self.dims_per_slot = model_dim // max_bytes
+        self.dims_per_slot = model_dim // max_bytes  # 48
         assert model_dim % max_bytes == 0
+        assert self.dims_per_slot == self.SHARED_PER_BYTE + self.TOKEN_PER_BYTE
 
-        self.byte_embed = nn.Embedding(257, self.dims_per_slot)  # 256 bytes + pad
-        self.token_down = nn.Embedding(vocab_size, rank)         # per-token latent
-        self.token_up = nn.Linear(rank, model_dim, bias=False)   # shared up-projection
+        self.byte_embed = nn.Embedding(257, self.SHARED_PER_BYTE)            # 257 x 40
+        self.token_embed = nn.Embedding(vocab_size, max_bytes * self.TOKEN_PER_BYTE)  # V x 128
+        self.token_down = nn.Embedding(vocab_size, rank)                     # V x 16
+        self.token_up = nn.Linear(rank, model_dim, bias=False)               # 16 x 768
 
         self.register_buffer('token_bytes', _build_token_byte_table(vocab_size, max_bytes, self.pad_idx), persistent=False)
 
         nn.init.normal_(self.byte_embed.weight, mean=0, std=byte_init_std)
+        nn.init.normal_(self.token_embed.weight, mean=0, std=token_init_std)
         nn.init.normal_(self.token_down.weight, mean=0, std=adapter_init_std)
         nn.init.zeros_(self.token_up.weight)  # start with no adapter contribution
         self.byte_embed.weight.label = f'{prefix}byte_embed'
+        self.token_embed.weight.label = f'{prefix}token_embed'
         self.token_down.weight.label = f'{prefix}token_down'
         self.token_up.weight.label = f'{prefix}token_up'
-
-    def embed_all(self) -> Tensor:
-        """Materialize full (vocab_size, model_dim) table from byte params + LoRA."""
-        base = self.byte_embed(self.token_bytes).reshape(self.vocab_size, self.model_dim)
-        adapter = self.token_up(self.token_down.weight)
-        return base + adapter
 
 @dataclass
 class ForwardScheduleConfig:
@@ -1026,10 +1028,10 @@ class GPT(nn.Module):
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        # Factored LoRA: 5 CompositeEmbedding instances, each ~817K params vs 38.6M original
+        # Factored: 5 CompositeEmbedding instances (40 shared + 8 per-token per slot + r=16 LoRA)
         self.ve_embeds = nn.ModuleList([
             CompositeEmbedding(self.vocab_size, model_dim, prefix=f've{i}_',
-                               byte_init_std=0.0, adapter_init_std=0.0)
+                               byte_init_std=0.0, token_init_std=0.0, adapter_init_std=0.0)
             for i in range(5)
         ])
 
@@ -1177,15 +1179,20 @@ class GPT(nn.Module):
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
 
         # Vectorized composite embeddings: main + 5 VEs in one pass
+        ces = [self.embed] + [self.ve_embeds[i] for i in range(5)]
         byte_seqs = self.embed.token_bytes[input_seq]                   # (T, 16)
-        all_byte_w = torch.stack([self.embed.byte_embed.weight] +
-                                 [self.ve_embeds[i].byte_embed.weight for i in range(5)])  # (6, 257, 48)
-        all_base = all_byte_w[:, byte_seqs].reshape(6, -1, 768)        # (6, T, 768)
-        all_down_w = torch.stack([self.embed.token_down.weight] +
-                                 [self.ve_embeds[i].token_down.weight for i in range(5)])  # (6, V, 64)
-        all_down = all_down_w[:, input_seq]                             # (6, T, 64)
-        all_up_w = torch.stack([self.embed.token_up.weight] +
-                               [self.ve_embeds[i].token_up.weight for i in range(5)])  # (6, 768, 64)
+        # Shared byte params: (6, 257, 40) -> (6, T, 16, 40)
+        all_byte_w = torch.stack([c.byte_embed.weight for c in ces])
+        all_shared = all_byte_w[:, byte_seqs]                           # (6, T, 16, 40)
+        # Per-token params: (6, V, 128) -> (6, T, 16, 8)
+        all_tok_w = torch.stack([c.token_embed.weight for c in ces])
+        all_per_tok = all_tok_w[:, input_seq].view(6, -1, 16, 8)        # (6, T, 16, 8)
+        # Cat shared + per-token, reshape to model_dim
+        all_base = torch.cat([all_shared, all_per_tok], dim=-1).reshape(6, -1, 768)  # (6, T, 768)
+        # LoRA adapter: (6, T, 16) -> einsum with (6, 768, 16) -> (6, T, 768)
+        all_down_w = torch.stack([c.token_down.weight for c in ces])
+        all_down = all_down_w[:, input_seq]                             # (6, T, 16)
+        all_up_w = torch.stack([c.token_up.weight for c in ces])        # (6, 768, 16)
         all_adapter = torch.einsum('btr,bdr->btd', all_down, all_up_w)  # (6, T, 768)
         all_embeds = all_base + all_adapter                             # (6, T, 768)
         x = all_embeds[0]
@@ -1565,10 +1572,12 @@ class TrainingManager():
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             # Main embed
             "byte_embed":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "token_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "token_down":     {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "token_up":       {"optim": "adam",    "comms": "replicated", "adam_betas": [0.75, 0.95], "wd_mul": 5.0},
             # Value embeds (5)
             **{f've{i}_byte_embed':  {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
+            **{f've{i}_token_embed': {"optim": "adam", "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
             **{f've{i}_token_down':  {"optim": "adam", "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
             **{f've{i}_token_up':    {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "wd_mul": 5.0} for i in range(5)},
             # Bigram
@@ -1588,8 +1597,8 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "byte_embed", "token_down", "token_up",  # Main composite embedding
-            *[f've{i}_byte_embed' for i in range(5)], *[f've{i}_token_down' for i in range(5)], *[f've{i}_token_up' for i in range(5)],  # Value embeddings
+            "byte_embed", "token_embed", "token_down", "token_up",  # Main composite embedding
+            *[f've{i}_byte_embed' for i in range(5)], *[f've{i}_token_embed' for i in range(5)], *[f've{i}_token_down' for i in range(5)], *[f've{i}_token_up' for i in range(5)],  # Value embeddings
             "bigram_byte_embed", "bigram_down", "bigram_up",  # Bigram
             "lm_head",               # lm_head
             "attn", "mlp",           # Large, polar express - process last to maximize overlap
