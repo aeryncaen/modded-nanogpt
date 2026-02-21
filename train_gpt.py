@@ -968,11 +968,16 @@ class CompositeEmbedding(nn.Module):
     Factored embedding: each BPE token is represented by concatenating learned
     descriptors for each of its constituent bytes.
 
-    For max_bytes=16, model_dim=768:
-      - byte_embed: nn.Embedding(257, 48)  -- 256 byte values + 1 pad
-      - 16 slots * 48 = 768
-      - total: 257 * 48 = 12,336 params
+    Per byte slot: 40 shared (from byte value) + 8 per-token = 48
+    16 slots * 48 = 768 = model_dim
+
+    Params:
+      - byte_embed:  nn.Embedding(257, 40)           -- 10,280 shared
+      - token_embed: nn.Embedding(vocab_size, 128)   -- per-token (16 * 8 = 128)
     """
+    SHARED_PER_BYTE = 40
+    TOKEN_PER_BYTE = 8
+
     def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16):
         super().__init__()
         self.vocab_size = vocab_size
@@ -982,22 +987,30 @@ class CompositeEmbedding(nn.Module):
 
         self.dims_per_slot = model_dim // max_bytes  # 48
         assert model_dim % max_bytes == 0
+        assert self.dims_per_slot == self.SHARED_PER_BYTE + self.TOKEN_PER_BYTE
 
-        self.byte_embed = nn.Embedding(257, self.dims_per_slot)  # 256 bytes + pad
+        self.byte_embed = nn.Embedding(257, self.SHARED_PER_BYTE)   # 256 bytes + pad
+        self.token_embed = nn.Embedding(vocab_size, max_bytes * self.TOKEN_PER_BYTE)  # 128 per token
 
         self.register_buffer('token_bytes', _build_token_byte_table(vocab_size, max_bytes, self.pad_idx), persistent=False)
 
         nn.init.normal_(self.byte_embed.weight, mean=0, std=0.02)
+        nn.init.normal_(self.token_embed.weight, mean=0, std=0.02)
         self.byte_embed.weight.label = 'byte_embed'
+        self.token_embed.weight.label = 'token_embed'
 
     def forward(self, token_ids: Tensor) -> Tensor:
-        byte_seqs = self.token_bytes[token_ids]        # (T, 16)
-        b_emb = self.byte_embed(byte_seqs)              # (T, 16, 48)
-        return b_emb.reshape(token_ids.size(0), self.model_dim)  # (T, 768)
+        byte_seqs = self.token_bytes[token_ids]                     # (T, 16)
+        shared = self.byte_embed(byte_seqs)                         # (T, 16, 40)
+        per_tok = self.token_embed(token_ids).view(-1, self.max_bytes, self.TOKEN_PER_BYTE)  # (T, 16, 8)
+        slot_emb = torch.cat([shared, per_tok], dim=-1)             # (T, 16, 48)
+        return slot_emb.reshape(token_ids.size(0), self.model_dim)  # (T, 768)
 
     def embed_all(self) -> Tensor:
-        b_emb = self.byte_embed(self.token_bytes)       # (V, 16, 48)
-        return b_emb.reshape(self.vocab_size, self.model_dim)
+        shared = self.byte_embed(self.token_bytes)                  # (V, 16, 40)
+        per_tok = self.token_embed.weight.view(self.vocab_size, self.max_bytes, self.TOKEN_PER_BYTE)  # (V, 16, 8)
+        slot_emb = torch.cat([shared, per_tok], dim=-1)             # (V, 16, 48)
+        return slot_emb.reshape(self.vocab_size, self.model_dim)
 
 @dataclass
 class ForwardScheduleConfig:
@@ -1545,6 +1558,7 @@ class TrainingManager():
             "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "byte_embed":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "token_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             **{f've{i}_byte_embed':  {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
             **{f've{i}_token_embed': {"optim": "adam", "comms": "sharded",   "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
@@ -1559,7 +1573,7 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "byte_embed",  # Composite embedding
+            "byte_embed", "token_embed",  # Composite embedding
             *[f've{i}_byte_embed' for i in range(5)], *[f've{i}_token_embed' for i in range(5)],  # Value embeddings
             "bigram_embed",  # Medium
             "lm_head",               # Large
