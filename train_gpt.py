@@ -1106,11 +1106,17 @@ class GPT(nn.Module):
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
-        # Transposed weight storage for faster gradient accumulation
-        self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
-
-        nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
-        self.lm_head.weight.label = 'lm_head'
+        # Factored lm_head: 40 shared byte + 8 per-token per slot (6.45M vs 38.6M)
+        self.lm_head_byte_embed = nn.Embedding(257, 40)
+        self.lm_head_token_embed = nn.Embedding(self.vocab_size, 128)
+        nn.init.normal_(self.lm_head_byte_embed.weight, mean=0, std=0.005)
+        nn.init.normal_(self.lm_head_token_embed.weight, mean=0, std=0.005)
+        self.lm_head_byte_embed.weight.label = 'head_byte_embed'
+        self.lm_head_token_embed.weight.label = 'head_token_embed'
+        self.lm_head_use_fp8 = use_fp8
+        self.lm_head_x_s = 100/448
+        self.lm_head_w_s = 1.6/448
+        self.lm_head_grad_s = grad_scale * 0.75/448
 
         self.embed = CompositeEmbedding(self.vocab_size, model_dim)
 
@@ -1245,13 +1251,17 @@ class GPT(nn.Module):
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
         x = norm(x)
+        # Materialize factored lm_head weight: (model_dim, vocab_size) contiguous
+        head_shared = self.lm_head_byte_embed(self.embed.token_bytes)  # (V, 16, 40)
+        head_per_tok = self.lm_head_token_embed.weight.view(self.vocab_size, 16, 8)  # (V, 16, 8)
+        lm_weight = torch.cat([head_shared, head_per_tok], dim=-1).reshape(self.vocab_size, 768).T.contiguous()  # (768, V)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
-            losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
+            losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, lm_weight, self.lm_head_x_s, self.lm_head_w_s, self.lm_head_grad_s)
             loss = losses.sum()
         else:
-            logits = self.lm_head(x)
+            logits = x @ lm_weight.type_as(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
             logits_for_loss = logits.float()
             loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
@@ -1562,7 +1572,8 @@ class TrainingManager():
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "head_byte_embed":  {"optim": "adam",   "comms": "replicated", "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "head_token_embed": {"optim": "adam",   "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
         # - Process smaller/faster params first while large reduces complete
@@ -1571,7 +1582,7 @@ class TrainingManager():
             "byte_embed", "token_embed",  # Composite embedding
             *[f've{i}_byte_embed' for i in range(5)], *[f've{i}_token_embed' for i in range(5)],  # Value embeddings
             "bigram_byte_embed", "bigram_token_embed",  # Bigram
-            "lm_head",               # Large
+            "head_byte_embed", "head_token_embed",  # Factored lm_head
             "attn", "mlp",           # Large, polar express - process last to maximize overlap
         ]
 
