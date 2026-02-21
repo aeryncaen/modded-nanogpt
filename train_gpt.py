@@ -1021,11 +1021,14 @@ class GPT(nn.Module):
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        # Factored as composite byte-level embeddings (5 * 12,336 = 61,680 params vs 193M)
-        self.value_embeds = nn.ModuleList([CompositeEmbedding(self.vocab_size, model_dim) for _ in range(5)])
-        for i, ve in enumerate(self.value_embeds):
-            nn.init.zeros_(ve.byte_embed.weight)
-            ve.byte_embed.weight.label = f've{i}_byte_embed'
+        # Factored: 40 shared byte + 8 per-token per slot. 5 instances: 5 * (10K + 6.4M) = ~32.2M vs 193M
+        self.ve_byte_embeds = nn.ModuleList([nn.Embedding(257, 40) for _ in range(5)])
+        self.ve_token_embeds = nn.ModuleList([nn.Embedding(self.vocab_size, 128) for _ in range(5)])
+        for i in range(5):
+            nn.init.zeros_(self.ve_byte_embeds[i].weight)
+            nn.init.zeros_(self.ve_token_embeds[i].weight)
+            self.ve_byte_embeds[i].weight.label = f've{i}_byte_embed'
+            self.ve_token_embeds[i].weight.label = f've{i}_token_embed'
 
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
@@ -1172,8 +1175,13 @@ class GPT(nn.Module):
         bigram_seq = self._compute_bigram_hash(input_seq)
         x0_bigram = self.bigram_embed(bigram_seq)[None]
 
-        # Value embeddings - composite byte-level factored
-        ve = [self.value_embeds[i](input_seq) for i in range(5)]
+        # Value embeddings - factored: 40 shared byte + 8 per-token per slot
+        byte_seqs = self.embed.token_bytes[input_seq]  # (T, 16) - reuse main embed's byte table
+        def _ve(i):
+            shared = self.ve_byte_embeds[i](byte_seqs)                  # (T, 16, 40)
+            per_tok = self.ve_token_embeds[i](input_seq).view(-1, 16, 8)  # (T, 16, 8)
+            return torch.cat([shared, per_tok], dim=-1).reshape(-1, 768)  # (T, 768)
+        ve = [_ve(i) for i in range(5)]
         # 01 ... 234 structure on token value embeddings by @photomz
         ve = [ve[0], ve[1]] + [None] * (self.num_layers - 5) + [ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
@@ -1537,7 +1545,8 @@ class TrainingManager():
             "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "byte_embed":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            **{f've{i}_byte_embed': {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
+            **{f've{i}_byte_embed':  {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
+            **{f've{i}_token_embed': {"optim": "adam", "comms": "sharded",   "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
@@ -1551,7 +1560,7 @@ class TrainingManager():
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
             "byte_embed",  # Composite embedding
-            *[f've{i}_byte_embed' for i in range(5)],  # Composite value embeddings
+            *[f've{i}_byte_embed' for i in range(5)], *[f've{i}_token_embed' for i in range(5)],  # Value embeddings
             "bigram_embed",  # Medium
             "lm_head",               # Large
             "attn", "mlp",           # Large, polar express - process last to maximize overlap
