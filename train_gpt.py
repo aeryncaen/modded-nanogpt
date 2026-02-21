@@ -998,6 +998,12 @@ class CompositeEmbedding(nn.Module):
         self.token_down.weight.label = f'{prefix}token_down'
         self.token_up.weight.label = f'{prefix}token_up'
 
+    def forward(self, token_ids: Tensor) -> Tensor:
+        byte_seqs = self.token_bytes[token_ids]                        # (T, 16)
+        base = self.byte_embed(byte_seqs).reshape(-1, self.model_dim)  # (T, model_dim)
+        adapter = self.token_up(self.token_down(token_ids))            # (T, model_dim)
+        return base + adapter
+
     def embed_all(self) -> Tensor:
         """Materialize full (vocab_size, model_dim) table from byte params + LoRA."""
         base = self.byte_embed(self.token_bytes).reshape(self.vocab_size, self.model_dim)
@@ -1176,9 +1182,7 @@ class GPT(nn.Module):
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
 
-        # Materialize all composite embedding tables once, then index
-        embed_table = self.embed.embed_all()          # (V, 768)
-        x = embed_table[input_seq]                    # (T, 768)
+        x = self.embed(input_seq)                        # (T, 768)
 
         # Bigram: byte base from prev+curr bytes, LoRA keyed on hash(prev,curr)
         byte_seqs = self.embed.token_bytes[input_seq]  # (T, 16)
@@ -1190,8 +1194,7 @@ class GPT(nn.Module):
         bigram_adapter = self.bigram_up(self.bigram_down(bigram_hash))  # (T, 768)
         x0_bigram = (bigram_base + bigram_adapter)[None]  # (1, T, 768)
 
-        ve_tables = [self.ve_embeds[i].embed_all() for i in range(5)]  # 5 x (V, 768)
-        ve = [ve_tables[i][input_seq] for i in range(5)]
+        ve = [self.ve_embeds[i](input_seq) for i in range(5)]
         # 01 ... 234 structure on token value embeddings by @photomz
         ve = [ve[0], ve[1]] + [None] * (self.num_layers - 5) + [ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
