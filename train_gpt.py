@@ -1114,9 +1114,13 @@ class GPT(nn.Module):
 
         self.embed = CompositeEmbedding(self.vocab_size, model_dim)
 
-        self.bigram_embed = nn.Embedding(args.bigram_vocab_size, model_dim)
-        self.bigram_embed.weight.label = 'bigram_embed'
-        nn.init.zeros_(self.bigram_embed.weight)
+        # Factored bigram: 32 slots (16 prev + 16 curr), 20 shared byte + 4 per-token = 24/slot
+        self.bigram_byte_embed = nn.Embedding(257, 20)
+        self.bigram_token_embed = nn.Embedding(self.vocab_size, 64)  # 16 bytes * 4 per-token
+        nn.init.zeros_(self.bigram_byte_embed.weight)
+        nn.init.zeros_(self.bigram_token_embed.weight)
+        self.bigram_byte_embed.weight.label = 'bigram_byte_embed'
+        self.bigram_token_embed.weight.label = 'bigram_token_embed'
 
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
@@ -1137,23 +1141,6 @@ class GPT(nn.Module):
             )
         )
         self.scalars.label = 'scalars'
-
-    @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
-    def _compute_bigram_hash(x: Tensor) -> Tensor:
-        """
-        Computes bigram hash for each position using [prev_token, curr_token].
-        Multiply by arbitary large ints to get even spread over int32 range.
-        Position 0 is mapped to the reserved index (vocab_size - 1).
-        BOS_tokens within the batch will hash based on last token of prior doc. Masking this ran slower and showed no improvement.
-        """
-        rand_int_1 = 36313
-        rand_int_2 = 27191
-        mod = args.bigram_vocab_size-1
-        result = torch.empty_like(x)
-        result[0] = mod
-        result[1:] = torch.bitwise_xor(rand_int_1 * x[1:], rand_int_2 * x[:-1]) % mod
-        return result
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
@@ -1185,11 +1172,18 @@ class GPT(nn.Module):
         # Composite embedding lookup - factored byte-level representation
         x = self.embed(input_seq)
         
-        bigram_seq = self._compute_bigram_hash(input_seq)
-        x0_bigram = self.bigram_embed(bigram_seq)[None]
+        # Factored bigram: 32 slots (16 prev bytes + 16 curr bytes), 20 shared + 4 per-token
+        byte_seqs = self.embed.token_bytes[input_seq]  # (T, 16) - reuse main embed's byte table
+        prev_bytes = torch.cat([byte_seqs[:1] * 0 + self.embed.pad_idx, byte_seqs[:-1]], dim=0)  # (T, 16)
+        bigram_bytes = torch.cat([prev_bytes, byte_seqs], dim=1)  # (T, 32)
+        bg_shared = self.bigram_byte_embed(bigram_bytes)  # (T, 32, 20)
+        prev_tok = torch.cat([input_seq[:1], input_seq[:-1]])  # pos 0 gets token 0's embed
+        prev_per = self.bigram_token_embed(prev_tok).view(-1, 16, 4)  # (T, 16, 4)
+        curr_per = self.bigram_token_embed(input_seq).view(-1, 16, 4)  # (T, 16, 4)
+        bg_per_tok = torch.cat([prev_per, curr_per], dim=1)  # (T, 32, 4)
+        x0_bigram = torch.cat([bg_shared, bg_per_tok], dim=-1).reshape(-1, 768)[None]  # (1, T, 768)
 
         # Value embeddings - factored: 40 shared byte + 8 per-token per slot
-        byte_seqs = self.embed.token_bytes[input_seq]  # (T, 16) - reuse main embed's byte table
         def _ve(i):
             shared = self.ve_byte_embeds[i](byte_seqs)                  # (T, 16, 40)
             per_tok = self.ve_token_embeds[i](input_seq).view(-1, 16, 8)  # (T, 16, 8)
@@ -1445,7 +1439,7 @@ class Hyperparameters:
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # bigram hash embedding
-    bigram_vocab_size: int = 50304 * 5
+
 
 args = Hyperparameters()
 
@@ -1561,7 +1555,8 @@ class TrainingManager():
             "token_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             **{f've{i}_byte_embed':  {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
             **{f've{i}_token_embed': {"optim": "adam", "comms": "sharded",   "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
-            "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "bigram_byte_embed":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0},
+            "bigram_token_embed": {"optim": "adam", "comms": "sharded",   "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
@@ -1575,7 +1570,7 @@ class TrainingManager():
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
             "byte_embed", "token_embed",  # Composite embedding
             *[f've{i}_byte_embed' for i in range(5)], *[f've{i}_token_embed' for i in range(5)],  # Value embeddings
-            "bigram_embed",  # Medium
+            "bigram_byte_embed", "bigram_token_embed",  # Bigram
             "lm_head",               # Large
             "attn", "mlp",           # Large, polar express - process last to maximize overlap
         ]
