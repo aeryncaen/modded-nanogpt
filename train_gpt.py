@@ -1186,7 +1186,7 @@ class GPT(nn.Module):
         all_down = all_down_w[:, input_seq]                             # (6, T, 64)
         all_up_w = torch.stack([self.embed.token_up.weight] +
                                [self.ve_embeds[i].token_up.weight for i in range(5)])  # (6, 768, 64)
-        all_adapter = torch.bmm(all_down, all_up_w.transpose(1, 2))    # (6, T, 768)
+        all_adapter = torch.einsum('btr,bdr->btd', all_down, all_up_w)  # (6, T, 768)
         all_embeds = all_base + all_adapter                             # (6, T, 768)
         x = all_embeds[0]
         ve = list(all_embeds[1:].unbind(0))
