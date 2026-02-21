@@ -967,31 +967,23 @@ class CompositeEmbedding(nn.Module):
     """
     Factored embedding: shared byte descriptors + per-token low-rank adapter.
 
-    Base: byte_embed(257, dims_per_slot) looked up for each byte slot, reshaped to model_dim.
+    Base: byte_embed(257, dims_per_slot) looked up per byte slot, reshaped to model_dim.
     Adapter: token_down(vocab_size, rank) -> token_up(rank, model_dim).
     Output = base + adapter.
-
-    num_byte_groups > 1 (e.g. bigram): forward takes multiple token ID tensors,
-    each contributes max_bytes slots. Total slots = num_byte_groups * max_bytes.
-    dims_per_slot = model_dim / total_slots.
 
     prefix: prepended to parameter labels for optimizer config namespacing.
     """
     def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16,
-                 rank: int = 16, num_byte_groups: int = 1, prefix: str = '',
+                 rank: int = 64, prefix: str = '',
                  byte_init_std: float = 0.02, adapter_init_std: float = 0.02):
         super().__init__()
         self.vocab_size = vocab_size
         self.model_dim = model_dim
         self.max_bytes = max_bytes
         self.pad_idx = 256
-        self.rank = rank
-        self.num_byte_groups = num_byte_groups
 
-        total_slots = num_byte_groups * max_bytes
-        self.total_slots = total_slots
-        self.dims_per_slot = model_dim // total_slots
-        assert model_dim % total_slots == 0
+        self.dims_per_slot = model_dim // max_bytes
+        assert model_dim % max_bytes == 0
 
         self.byte_embed = nn.Embedding(257, self.dims_per_slot)  # 256 bytes + pad
         self.token_down = nn.Embedding(vocab_size, rank)         # per-token latent
@@ -1006,24 +998,10 @@ class CompositeEmbedding(nn.Module):
         self.token_down.weight.label = f'{prefix}token_down'
         self.token_up.weight.label = f'{prefix}token_up'
 
-    def forward(self, *token_ids: Tensor) -> Tensor:
-        """
-        token_ids: one or more (T,) tensors. For single-group (default), pass one.
-        For bigram (num_byte_groups=2), pass (prev_tokens, curr_tokens).
-        """
-        assert len(token_ids) == self.num_byte_groups
-        byte_groups = [self.token_bytes[tid] for tid in token_ids]  # each (T, 16)
-        byte_seqs = torch.cat(byte_groups, dim=1) if len(byte_groups) > 1 else byte_groups[0]  # (T, total_slots)
-        base = self.byte_embed(byte_seqs).reshape(-1, self.model_dim)  # (T, model_dim)
-        # adapter: sum adapters for each token group
-        adapter = sum(self.token_up(self.token_down(tid)) for tid in token_ids)  # (T, model_dim)
-        return base + adapter
-
     def embed_all(self) -> Tensor:
-        """Materialize full (vocab_size, model_dim) matrix. Only valid for num_byte_groups=1."""
-        assert self.num_byte_groups == 1
-        base = self.byte_embed(self.token_bytes).reshape(self.vocab_size, self.model_dim)  # (V, model_dim)
-        adapter = self.token_up(self.token_down.weight)             # (V, model_dim)
+        """Materialize full (vocab_size, model_dim) table from byte params + LoRA."""
+        base = self.byte_embed(self.token_bytes).reshape(self.vocab_size, self.model_dim)
+        adapter = self.token_up(self.token_down.weight)
         return base + adapter
 
 @dataclass
@@ -1050,7 +1028,7 @@ class GPT(nn.Module):
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         # Factored LoRA: 5 CompositeEmbedding instances, each ~817K params vs 38.6M original
         self.ve_embeds = nn.ModuleList([
-            CompositeEmbedding(self.vocab_size, model_dim, rank=16, prefix=f've{i}_',
+            CompositeEmbedding(self.vocab_size, model_dim, prefix=f've{i}_',
                                byte_init_std=0.0, adapter_init_std=0.0)
             for i in range(5)
         ])
@@ -1125,11 +1103,16 @@ class GPT(nn.Module):
 
         self.embed = CompositeEmbedding(self.vocab_size, model_dim)
 
-        # Factored bigram: CompositeEmbedding with num_byte_groups=2 (prev + curr tokens)
-        # 32 slots * 24 params/slot = 768, plus LoRA rank=16
-        self.bigram = CompositeEmbedding(self.vocab_size, model_dim, rank=16,
-                                         num_byte_groups=2, prefix='bigram_',
-                                         byte_init_std=0.0, adapter_init_std=0.0)
+        # Factored bigram: byte base (32 slots from prev+curr) + LoRA keyed on hash(prev,curr)
+        self.bigram_byte_embed = nn.Embedding(257, model_dim // 32)  # 257 x 24, shared byte params
+        nn.init.zeros_(self.bigram_byte_embed.weight)
+        self.bigram_byte_embed.weight.label = 'bigram_byte_embed'
+        self.bigram_down = nn.Embedding(args.bigram_vocab_size, 64)  # per-bucket latent
+        nn.init.zeros_(self.bigram_down.weight)
+        self.bigram_down.weight.label = 'bigram_down'
+        self.bigram_up = nn.Linear(64, model_dim, bias=False)  # shared up-projection
+        nn.init.zeros_(self.bigram_up.weight)
+        self.bigram_up.weight.label = 'bigram_up'
 
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
@@ -1150,6 +1133,21 @@ class GPT(nn.Module):
             )
         )
         self.scalars.label = 'scalars'
+
+    @staticmethod
+    def _compute_bigram_hash(x: Tensor) -> Tensor:
+        """
+        Computes bigram hash for each position using [prev_token, curr_token].
+        Multiply by arbitary large ints to get even spread over int32 range.
+        Position 0 is mapped to the reserved index (vocab_size - 1).
+        """
+        rand_int_1 = 36313
+        rand_int_2 = 27191
+        mod = args.bigram_vocab_size-1
+        result = torch.empty_like(x)
+        result[0] = mod
+        result[1:] = torch.bitwise_xor(rand_int_1 * x[1:], rand_int_2 * x[:-1]) % mod
+        return result
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
@@ -1178,15 +1176,22 @@ class GPT(nn.Module):
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
 
-        # Composite embedding lookup - factored byte-level representation
-        x = self.embed(input_seq)
+        # Materialize all composite embedding tables once, then index
+        embed_table = self.embed.embed_all()          # (V, 768)
+        x = embed_table[input_seq]                    # (T, 768)
 
-        # Factored bigram: CompositeEmbedding with 2 byte groups (prev + curr token)
+        # Bigram: byte base from prev+curr bytes, LoRA keyed on hash(prev,curr)
+        byte_seqs = self.embed.token_bytes[input_seq]  # (T, 16)
         prev_tok = torch.cat([input_seq[:1], input_seq[:-1]])
-        x0_bigram = self.bigram(prev_tok, input_seq)[None]  # (1, T, 768)
+        prev_bytes = self.embed.token_bytes[prev_tok]  # (T, 16)
+        bigram_bytes = torch.cat([prev_bytes, byte_seqs], dim=1)  # (T, 32)
+        bigram_base = self.bigram_byte_embed(bigram_bytes).reshape(-1, 768)  # (T, 768)
+        bigram_hash = self._compute_bigram_hash(input_seq)
+        bigram_adapter = self.bigram_up(self.bigram_down(bigram_hash))  # (T, 768)
+        x0_bigram = (bigram_base + bigram_adapter)[None]  # (1, T, 768)
 
-        # Value embeddings - factored LoRA CompositeEmbeddings
-        ve = [self.ve_embeds[i](input_seq) for i in range(5)]
+        ve_tables = [self.ve_embeds[i].embed_all() for i in range(5)]  # 5 x (V, 768)
+        ve = [ve_tables[i][input_seq] for i in range(5)]
         # 01 ... 234 structure on token value embeddings by @photomz
         ve = [ve[0], ve[1]] + [None] * (self.num_layers - 5) + [ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
@@ -1437,7 +1442,7 @@ class Hyperparameters:
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # bigram hash embedding
-
+    bigram_vocab_size: int = 50304 * 5
 
 args = Hyperparameters()
 
@@ -1561,8 +1566,8 @@ class TrainingManager():
             **{f've{i}_token_up':    {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "wd_mul": 5.0} for i in range(5)},
             # Bigram
             "bigram_byte_embed":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0},
-            "bigram_token_down":  {"optim": "adam", "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0},
-            "bigram_token_up":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "wd_mul": 5.0},
+            "bigram_down":        {"optim": "adam", "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0},
+            "bigram_up":          {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "wd_mul": 5.0},
             # Gates
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
@@ -1578,7 +1583,7 @@ class TrainingManager():
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
             "byte_embed", "token_down", "token_up",  # Main composite embedding
             *[f've{i}_byte_embed' for i in range(5)], *[f've{i}_token_down' for i in range(5)], *[f've{i}_token_up' for i in range(5)],  # Value embeddings
-            "bigram_byte_embed", "bigram_token_down", "bigram_token_up",  # Bigram
+            "bigram_byte_embed", "bigram_down", "bigram_up",  # Bigram
             "lm_head",               # lm_head
             "attn", "mlp",           # Large, polar express - process last to maximize overlap
         ]
