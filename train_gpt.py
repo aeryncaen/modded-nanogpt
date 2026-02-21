@@ -965,52 +965,66 @@ def _build_token_byte_table(vocab_size: int, max_bytes: int = 16, pad_idx: int =
 
 class CompositeEmbedding(nn.Module):
     """
-    Factored embedding: each BPE token is represented by concatenating learned
-    descriptors for each of its constituent bytes.
+    Factored embedding: shared byte descriptors + per-token low-rank adapter.
 
-    Per byte slot: 40 shared (from byte value) + 8 per-token = 48
-    16 slots * 48 = 768 = model_dim
+    Base: byte_embed(257, dims_per_slot) looked up for each byte slot, reshaped to model_dim.
+    Adapter: token_down(vocab_size, rank) -> token_up(rank, model_dim).
+    Output = base + adapter.
 
-    Params:
-      - byte_embed:  nn.Embedding(257, 40)           -- 10,280 shared
-      - token_embed: nn.Embedding(vocab_size, 128)   -- per-token (16 * 8 = 128)
+    num_byte_groups > 1 (e.g. bigram): forward takes multiple token ID tensors,
+    each contributes max_bytes slots. Total slots = num_byte_groups * max_bytes.
+    dims_per_slot = model_dim / total_slots.
+
+    prefix: prepended to parameter labels for optimizer config namespacing.
     """
-    SHARED_PER_BYTE = 40
-    TOKEN_PER_BYTE = 8
-
-    def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16):
+    def __init__(self, vocab_size: int, model_dim: int, max_bytes: int = 16,
+                 rank: int = 16, num_byte_groups: int = 1, prefix: str = '',
+                 byte_init_std: float = 0.02, adapter_init_std: float = 0.02):
         super().__init__()
         self.vocab_size = vocab_size
         self.model_dim = model_dim
         self.max_bytes = max_bytes
         self.pad_idx = 256
+        self.rank = rank
+        self.num_byte_groups = num_byte_groups
 
-        self.dims_per_slot = model_dim // max_bytes  # 48
-        assert model_dim % max_bytes == 0
-        assert self.dims_per_slot == self.SHARED_PER_BYTE + self.TOKEN_PER_BYTE
+        total_slots = num_byte_groups * max_bytes
+        self.total_slots = total_slots
+        self.dims_per_slot = model_dim // total_slots
+        assert model_dim % total_slots == 0
 
-        self.byte_embed = nn.Embedding(257, self.SHARED_PER_BYTE)   # 256 bytes + pad
-        self.token_embed = nn.Embedding(vocab_size, max_bytes * self.TOKEN_PER_BYTE)  # 128 per token
+        self.byte_embed = nn.Embedding(257, self.dims_per_slot)  # 256 bytes + pad
+        self.token_down = nn.Embedding(vocab_size, rank)         # per-token latent
+        self.token_up = nn.Linear(rank, model_dim, bias=False)   # shared up-projection
 
         self.register_buffer('token_bytes', _build_token_byte_table(vocab_size, max_bytes, self.pad_idx), persistent=False)
 
-        nn.init.normal_(self.byte_embed.weight, mean=0, std=0.02)
-        nn.init.normal_(self.token_embed.weight, mean=0, std=0.02)
-        self.byte_embed.weight.label = 'byte_embed'
-        self.token_embed.weight.label = 'token_embed'
+        nn.init.normal_(self.byte_embed.weight, mean=0, std=byte_init_std)
+        nn.init.normal_(self.token_down.weight, mean=0, std=adapter_init_std)
+        nn.init.zeros_(self.token_up.weight)  # start with no adapter contribution
+        self.byte_embed.weight.label = f'{prefix}byte_embed'
+        self.token_down.weight.label = f'{prefix}token_down'
+        self.token_up.weight.label = f'{prefix}token_up'
 
-    def forward(self, token_ids: Tensor) -> Tensor:
-        byte_seqs = self.token_bytes[token_ids]                     # (T, 16)
-        shared = self.byte_embed(byte_seqs)                         # (T, 16, 40)
-        per_tok = self.token_embed(token_ids).view(-1, self.max_bytes, self.TOKEN_PER_BYTE)  # (T, 16, 8)
-        slot_emb = torch.cat([shared, per_tok], dim=-1)             # (T, 16, 48)
-        return slot_emb.reshape(token_ids.size(0), self.model_dim)  # (T, 768)
+    def forward(self, *token_ids: Tensor) -> Tensor:
+        """
+        token_ids: one or more (T,) tensors. For single-group (default), pass one.
+        For bigram (num_byte_groups=2), pass (prev_tokens, curr_tokens).
+        """
+        assert len(token_ids) == self.num_byte_groups
+        byte_groups = [self.token_bytes[tid] for tid in token_ids]  # each (T, 16)
+        byte_seqs = torch.cat(byte_groups, dim=1) if len(byte_groups) > 1 else byte_groups[0]  # (T, total_slots)
+        base = self.byte_embed(byte_seqs).reshape(-1, self.model_dim)  # (T, model_dim)
+        # adapter: sum adapters for each token group
+        adapter = sum(self.token_up(self.token_down(tid)) for tid in token_ids)  # (T, model_dim)
+        return base + adapter
 
     def embed_all(self) -> Tensor:
-        shared = self.byte_embed(self.token_bytes)                  # (V, 16, 40)
-        per_tok = self.token_embed.weight.view(self.vocab_size, self.max_bytes, self.TOKEN_PER_BYTE)  # (V, 16, 8)
-        slot_emb = torch.cat([shared, per_tok], dim=-1)             # (V, 16, 48)
-        return slot_emb.reshape(self.vocab_size, self.model_dim)
+        """Materialize full (vocab_size, model_dim) matrix. Only valid for num_byte_groups=1."""
+        assert self.num_byte_groups == 1
+        base = self.byte_embed(self.token_bytes).reshape(self.vocab_size, self.model_dim)  # (V, model_dim)
+        adapter = self.token_up(self.token_down.weight)             # (V, model_dim)
+        return base + adapter
 
 @dataclass
 class ForwardScheduleConfig:
@@ -1034,14 +1048,12 @@ class GPT(nn.Module):
 
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        # Factored: 40 shared byte + 8 per-token per slot. 5 instances: 5 * (10K + 6.4M) = ~32.2M vs 193M
-        self.ve_byte_embeds = nn.ModuleList([nn.Embedding(257, 40) for _ in range(5)])
-        self.ve_token_embeds = nn.ModuleList([nn.Embedding(self.vocab_size, 128) for _ in range(5)])
-        for i in range(5):
-            nn.init.zeros_(self.ve_byte_embeds[i].weight)
-            nn.init.zeros_(self.ve_token_embeds[i].weight)
-            self.ve_byte_embeds[i].weight.label = f've{i}_byte_embed'
-            self.ve_token_embeds[i].weight.label = f've{i}_token_embed'
+        # Factored LoRA: 5 CompositeEmbedding instances, each ~817K params vs 38.6M original
+        self.ve_embeds = nn.ModuleList([
+            CompositeEmbedding(self.vocab_size, model_dim, rank=16, prefix=f've{i}_',
+                               byte_init_std=0.0, adapter_init_std=0.0)
+            for i in range(5)
+        ])
 
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
@@ -1106,27 +1118,18 @@ class GPT(nn.Module):
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
-        # Factored lm_head: 40 shared byte + 8 per-token per slot (6.45M vs 38.6M)
-        self.lm_head_byte_embed = nn.Embedding(257, 40)
-        self.lm_head_token_embed = nn.Embedding(self.vocab_size, 128)
-        nn.init.normal_(self.lm_head_byte_embed.weight, mean=0, std=0.005)
-        nn.init.normal_(self.lm_head_token_embed.weight, mean=0, std=0.005)
-        self.lm_head_byte_embed.weight.label = 'head_byte_embed'
-        self.lm_head_token_embed.weight.label = 'head_token_embed'
-        self.lm_head_use_fp8 = use_fp8
-        self.lm_head_x_s = 100/448
-        self.lm_head_w_s = 1.6/448
-        self.lm_head_grad_s = grad_scale * 0.75/448
+        # Transposed weight storage for faster gradient accumulation
+        self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
+        nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
+        self.lm_head.weight.label = 'lm_head'
 
         self.embed = CompositeEmbedding(self.vocab_size, model_dim)
 
-        # Factored bigram: 32 slots (16 prev + 16 curr), 20 shared byte + 4 per-token = 24/slot
-        self.bigram_byte_embed = nn.Embedding(257, 20)
-        self.bigram_token_embed = nn.Embedding(self.vocab_size, 64)  # 16 bytes * 4 per-token
-        nn.init.zeros_(self.bigram_byte_embed.weight)
-        nn.init.zeros_(self.bigram_token_embed.weight)
-        self.bigram_byte_embed.weight.label = 'bigram_byte_embed'
-        self.bigram_token_embed.weight.label = 'bigram_token_embed'
+        # Factored bigram: CompositeEmbedding with num_byte_groups=2 (prev + curr tokens)
+        # 32 slots * 24 params/slot = 768, plus LoRA rank=16
+        self.bigram = CompositeEmbedding(self.vocab_size, model_dim, rank=16,
+                                         num_byte_groups=2, prefix='bigram_',
+                                         byte_init_std=0.0, adapter_init_std=0.0)
 
         # x0_lambdas separated out for different optimizer treatment (no beta smoothing)
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
@@ -1177,24 +1180,13 @@ class GPT(nn.Module):
 
         # Composite embedding lookup - factored byte-level representation
         x = self.embed(input_seq)
-        
-        # Factored bigram: 32 slots (16 prev bytes + 16 curr bytes), 20 shared + 4 per-token
-        byte_seqs = self.embed.token_bytes[input_seq]  # (T, 16) - reuse main embed's byte table
-        prev_bytes = torch.cat([byte_seqs[:1] * 0 + self.embed.pad_idx, byte_seqs[:-1]], dim=0)  # (T, 16)
-        bigram_bytes = torch.cat([prev_bytes, byte_seqs], dim=1)  # (T, 32)
-        bg_shared = self.bigram_byte_embed(bigram_bytes)  # (T, 32, 20)
-        prev_tok = torch.cat([input_seq[:1], input_seq[:-1]])  # pos 0 gets token 0's embed
-        prev_per = self.bigram_token_embed(prev_tok).view(-1, 16, 4)  # (T, 16, 4)
-        curr_per = self.bigram_token_embed(input_seq).view(-1, 16, 4)  # (T, 16, 4)
-        bg_per_tok = torch.cat([prev_per, curr_per], dim=1)  # (T, 32, 4)
-        x0_bigram = torch.cat([bg_shared, bg_per_tok], dim=-1).reshape(-1, 768)[None]  # (1, T, 768)
 
-        # Value embeddings - factored: 40 shared byte + 8 per-token per slot
-        def _ve(i):
-            shared = self.ve_byte_embeds[i](byte_seqs)                  # (T, 16, 40)
-            per_tok = self.ve_token_embeds[i](input_seq).view(-1, 16, 8)  # (T, 16, 8)
-            return torch.cat([shared, per_tok], dim=-1).reshape(-1, 768)  # (T, 768)
-        ve = [_ve(i) for i in range(5)]
+        # Factored bigram: CompositeEmbedding with 2 byte groups (prev + curr token)
+        prev_tok = torch.cat([input_seq[:1], input_seq[:-1]])
+        x0_bigram = self.bigram(prev_tok, input_seq)[None]  # (1, T, 768)
+
+        # Value embeddings - factored LoRA CompositeEmbeddings
+        ve = [self.ve_embeds[i](input_seq) for i in range(5)]
         # 01 ... 234 structure on token value embeddings by @photomz
         ve = [ve[0], ve[1]] + [None] * (self.num_layers - 5) + [ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
@@ -1251,17 +1243,13 @@ class GPT(nn.Module):
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
         x = norm(x)
-        # Materialize factored lm_head weight: (model_dim, vocab_size) contiguous
-        head_shared = self.lm_head_byte_embed(self.embed.token_bytes)  # (V, 16, 40)
-        head_per_tok = self.lm_head_token_embed.weight.view(self.vocab_size, 16, 8)  # (V, 16, 8)
-        lm_weight = torch.cat([head_shared, head_per_tok], dim=-1).reshape(self.vocab_size, 768).T.contiguous()  # (768, V)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
-            losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, lm_weight, self.lm_head_x_s, self.lm_head_w_s, self.lm_head_grad_s)
+            losses = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
             loss = losses.sum()
         else:
-            logits = x @ lm_weight.type_as(x)
+            logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
             logits_for_loss = logits.float()
             loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
@@ -1557,32 +1545,41 @@ class TrainingManager():
         # - Ordering dictates when to launch reduce/reduce_scatter operations
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
+        # byte_embed: replicated (257 entries, dense grads). token_down: sharded (vocab_size, sparse).
+        # token_up: replicated (rank x model_dim, small dense matrix, default lr).
         self.param_table = {
             "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
+            # Main embed
             "byte_embed":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
-            "token_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "token_down":     {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "token_up":       {"optim": "adam",    "comms": "replicated", "adam_betas": [0.75, 0.95], "wd_mul": 5.0},
+            # Value embeds (5)
             **{f've{i}_byte_embed':  {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
-            **{f've{i}_token_embed': {"optim": "adam", "comms": "sharded",   "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
+            **{f've{i}_token_down':  {"optim": "adam", "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0} for i in range(5)},
+            **{f've{i}_token_up':    {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "wd_mul": 5.0} for i in range(5)},
+            # Bigram
             "bigram_byte_embed":  {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0},
-            "bigram_token_embed": {"optim": "adam", "comms": "sharded",   "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0},
+            "bigram_token_down":  {"optim": "adam", "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75., "wd_mul": 5.0},
+            "bigram_token_up":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.75, 0.95], "wd_mul": 5.0},
+            # Gates
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "head_byte_embed":  {"optim": "adam",   "comms": "replicated", "adam_betas": [0.5,  0.95], "wd_mul": 150.},
-            "head_token_embed": {"optim": "adam",   "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            # lm_head
+            "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
         # - Process smaller/faster params first while large reduces complete
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "byte_embed", "token_embed",  # Composite embedding
-            *[f've{i}_byte_embed' for i in range(5)], *[f've{i}_token_embed' for i in range(5)],  # Value embeddings
-            "bigram_byte_embed", "bigram_token_embed",  # Bigram
-            "head_byte_embed", "head_token_embed",  # Factored lm_head
+            "byte_embed", "token_down", "token_up",  # Main composite embedding
+            *[f've{i}_byte_embed' for i in range(5)], *[f've{i}_token_down' for i in range(5)], *[f've{i}_token_up' for i in range(5)],  # Value embeddings
+            "bigram_byte_embed", "bigram_token_down", "bigram_token_up",  # Bigram
+            "lm_head",               # lm_head
             "attn", "mlp",           # Large, polar express - process last to maximize overlap
         ]
 
