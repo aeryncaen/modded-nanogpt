@@ -876,7 +876,7 @@ class CausalSelfAttention(nn.Module):
 
             if ve is not None:
                 ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T, self.num_heads, 1)
-                v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
+                v = v * (1 + ve_gate_out * ve.view_as(v))
 
         else:
             # Paired heads: adjacent heads' queries attend to each other's keys.
@@ -894,7 +894,7 @@ class CausalSelfAttention(nn.Module):
 
             if ve is not None:
                 ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T * 2, self.num_heads // 2, 1)
-                v = v + ve_gate_out * ve.view_as(v)
+                v = v * (1 + ve_gate_out * ve.view_as(v))
 
             seqlens = 2 * seqlens
             max_len = 2 * max_len
