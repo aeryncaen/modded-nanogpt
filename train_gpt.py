@@ -359,6 +359,8 @@ class NorMuonAndAdam:
                 weight_decay=self.adam_defaults["weight_decay"],
                 eps=self.adam_defaults["eps"],
                 chunk_size=chunk_size,
+                adaptive_lr=self.adam_defaults.get("adaptive_lr", True),
+                gnorm_beta=self.adam_defaults.get("gnorm_beta", 0.95),
             )
         elif optim == "normuon":
             reshape = getattr(param, "reshape", None)
@@ -418,7 +420,13 @@ class NorMuonAndAdam:
                 else:
                     chunk = param
                 exp_avg = torch.zeros_like(chunk, dtype=torch.float32, device=param.device)
-                self.param_states[param] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=torch.zeros_like(exp_avg))
+                self.param_states[param] = dict(
+                    step=0,
+                    exp_avg=exp_avg,
+                    exp_avg_sq=torch.zeros_like(exp_avg),
+                    gnorm_ema=torch.zeros((), dtype=torch.float32, device=param.device),
+                    gnorm_max=torch.zeros((), dtype=torch.float32, device=param.device),
+                )
 
             elif p_cfg.optim == "normuon":
                 chunk_shape = (p_cfg.chunk_size, *p_cfg.reshape[1:])
@@ -694,7 +702,7 @@ class NorMuonAndAdam:
     def _adam_update(self, param: nn.Parameter, grad_chunk: Tensor, p_cfg: ParamConfig, rank: int) -> Tensor:
         """Apply Adam update to a parameter. Returns the updated p_slice."""
         beta1, beta2 = p_cfg.adam_betas
-        lr = p_cfg.lr * p_cfg.lr_mul
+        ceiling_lr = p_cfg.lr * p_cfg.lr_mul
 
         # Get parameter slice
         if p_cfg.comms == "sharded":
@@ -705,6 +713,26 @@ class NorMuonAndAdam:
         p_state = self.param_states[param]
         p_state["step"] += 1
         t = p_state["step"]
+
+        # AutoNorMuon-style adaptive LR (per Adam module/label)
+        if p_cfg.adaptive_lr:
+            gnorm = grad_chunk.float().norm()
+            if t == 1:
+                p_state["gnorm_ema"].copy_(gnorm)
+                p_state["gnorm_max"].copy_(gnorm)
+            else:
+                beta = p_cfg.gnorm_beta if p_cfg.gnorm_beta is not None else 0.95
+                p_state["gnorm_ema"].lerp_(gnorm, 1 - beta)
+                torch.maximum(p_state["gnorm_max"], gnorm, out=p_state["gnorm_max"])
+
+            ratio = p_state["gnorm_ema"] / p_state["gnorm_max"].clamp_min(1e-12)
+            ema_factor = 0.5 * (1.0 + torch.cos((1.0 - ratio) * math.pi))
+            tracked_lr = p_cfg.initial_lr * p_cfg.lr_mul * ema_factor
+            ceiling_lr_t = torch.full_like(tracked_lr, ceiling_lr)
+            harmonic_lr = 2.0 * ceiling_lr_t * tracked_lr / (ceiling_lr_t + tracked_lr).clamp_min(1e-20)
+            lr = torch.where(ceiling_lr_t < tracked_lr, harmonic_lr, tracked_lr).item()
+        else:
+            lr = ceiling_lr
 
         bias1, bias2 = 1 - beta1 ** t, 1 - beta2 ** t
         self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
@@ -1486,6 +1514,9 @@ class Hyperparameters:
     normuon_adaptive_lr: bool = os.environ.get("NORMUON_ADAPTIVE_LR", "1") == "1"
     normuon_gnorm_beta: float = float(os.environ.get("NORMUON_GNORM_BETA", "0.95"))
     normuon_retract_rows: bool = True  # required: always retract rows to product of spheres
+    # AutoNorMuon-style Adam features
+    adam_adaptive_lr: bool = os.environ.get("ADAM_ADAPTIVE_LR", "1") == "1"
+    adam_gnorm_beta: float = float(os.environ.get("ADAM_GNORM_BETA", "0.95"))
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1632,6 +1663,8 @@ class TrainingManager():
             lr=0.008,
             eps=1e-10,
             weight_decay=0.005,
+            adaptive_lr=args.adam_adaptive_lr,
+            gnorm_beta=args.adam_gnorm_beta,
         )
 
         normuon_defaults = dict(
