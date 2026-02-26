@@ -232,6 +232,10 @@ class ParamConfig:
     momentum: float | None = None
     beta2: float | None = None
     per_matrix_lr_mul: list[float] | None = None
+    # AutoNorMuon-style adaptive LR (NorMuon only)
+    adaptive_lr: bool = False
+    gnorm_beta: float | None = None
+    retract_rows: bool = False
 
 
 class NorMuonAndAdam:
@@ -395,6 +399,9 @@ class NorMuonAndAdam:
                 momentum=self.normuon_defaults["momentum"],
                 beta2=self.normuon_defaults["beta2"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
+                adaptive_lr=self.normuon_defaults.get("adaptive_lr", True),
+                gnorm_beta=self.normuon_defaults.get("gnorm_beta", 0.95),
+                retract_rows=self.normuon_defaults.get("retract_rows", True),
             )
         else:
             raise ValueError(f"Unknown optim type: {optim}")
@@ -435,10 +442,25 @@ class NorMuonAndAdam:
                     chunk_shape, dtype=torch.uint16, device=param.device
                 )
 
+                # AutoNorMuon-style per-matrix grad-norm tracking
+                gnorm_ema = torch.zeros((p_cfg.chunk_size,), dtype=torch.float32, device=param.device)
+                gnorm_max = torch.zeros((p_cfg.chunk_size,), dtype=torch.float32, device=param.device)
+
+                if p_cfg.per_matrix_lr_mul is not None:
+                    per_matrix_lr_mul_t = torch.tensor(
+                        p_cfg.per_matrix_lr_mul, dtype=torch.float32, device=param.device
+                    )
+                else:
+                    per_matrix_lr_mul_t = torch.ones((p_cfg.chunk_size,), dtype=torch.float32, device=param.device)
+
                 self.param_states[param] = dict(
+                    step=0,
                     momentum_buffer=momentum_buffer,
                     second_momentum_buffer=second_momentum_buffer,
                     mantissa=mantissa,
+                    gnorm_ema=gnorm_ema,
+                    gnorm_max=gnorm_max,
+                    per_matrix_lr_mul=per_matrix_lr_mul_t,
                 )
 
     # -----------------------------------
@@ -500,9 +522,12 @@ class NorMuonAndAdam:
         for param, p_cfg in self.param_cfgs.items():
             if p_cfg.optim == "normuon":
                 p_state = self.param_states[param]
+                p_state["step"] = 0
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
                 p_state["second_momentum_buffer"].zero_()
+                p_state["gnorm_ema"].zero_()
+                p_state["gnorm_max"].zero_()
 
     def copy_lm_state_to_embed(self):
         """
@@ -714,13 +739,13 @@ class NorMuonAndAdam:
         p_state = self.param_states[param]
         grad_chunk = grad_chunk.float()  # FP32 for momentum
 
+        if "step" not in p_state:
+            p_state["step"] = 0
+
         # Momentum update
         momentum_buffer = p_state["momentum_buffer"]
         momentum_buffer.lerp_(grad_chunk, 1 - p_cfg.momentum)
         updated_grads = grad_chunk.lerp_(momentum_buffer, p_cfg.momentum)
-
-        self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
-        self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
         # Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
@@ -736,20 +761,45 @@ class NorMuonAndAdam:
         param_view = param.data.view(p_cfg.reshape)
         p_slice = param_view[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
 
-        # MLP has per-matrix LR multipliers (c_proj gets 2x LR)
-        if p_cfg.per_matrix_lr_mul is not None:
-            for mat_idx in range(p_cfg.chunk_size):
-                self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.per_matrix_lr_mul[mat_idx] * p_cfg.lr)
-                self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
-                NorMuonAndAdam._cautious_wd_and_update_inplace(
-                    p_slice[mat_idx].view(torch.uint16), p_state["mantissa"][mat_idx], v_chunk[mat_idx],
-                    self._eff_wd_t, self._eff_lr_t
-                )
+        # AutoNorMuon-style adaptive LR per matrix
+        if p_cfg.adaptive_lr:
+            p_state["step"] += 1
+            gnorm = grad_chunk.view(chunk_shape[0], -1).norm(dim=1)
+            gnorm_ema = p_state["gnorm_ema"]
+            gnorm_max = p_state["gnorm_max"]
+            if p_state["step"] == 1:
+                gnorm_ema.copy_(gnorm)
+                gnorm_max.copy_(gnorm)
+            else:
+                beta = p_cfg.gnorm_beta if p_cfg.gnorm_beta is not None else 0.95
+                gnorm_ema.lerp_(gnorm, 1 - beta)
+                torch.maximum(gnorm_max, gnorm, out=gnorm_max)
+
+            ratio = gnorm_ema / gnorm_max.clamp_min(1e-12)
+            ema_factor = 0.5 * (1.0 + torch.cos((1.0 - ratio) * math.pi))
+            tracked_lr = p_cfg.initial_lr * ema_factor
+            # p_cfg.lr is the external schedule ceiling from TrainingManager
+            ceiling_lr = torch.full_like(tracked_lr, p_cfg.lr)
+            harmonic_lr = 2.0 * ceiling_lr * tracked_lr / (ceiling_lr + tracked_lr).clamp_min(1e-20)
+            base_lr_vec = torch.where(ceiling_lr < tracked_lr, harmonic_lr, tracked_lr)
         else:
-            NorMuonAndAdam._cautious_wd_and_update_inplace(
-                p_slice.view(torch.uint16), p_state["mantissa"], v_chunk,
-                self._eff_wd_t, self._eff_lr_t
-            )
+            base_lr_vec = torch.full((chunk_shape[0],), p_cfg.lr, device=grad_chunk.device, dtype=torch.float32)
+
+        # Per-matrix multipliers (MLP c_proj gets 2x LR)
+        lr_vec = base_lr_vec * p_cfg.lr_mul * p_state["per_matrix_lr_mul"]
+        lr_tensor = lr_vec.view(chunk_shape[0], *([1] * (v_chunk.ndim - 1)))
+
+        # Keep cautious weight decay semantics from existing implementation
+        self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
+
+        NorMuonAndAdam._cautious_wd_and_update_inplace(
+            p_slice.view(torch.uint16), p_state["mantissa"], v_chunk,
+            self._eff_wd_t, lr_tensor
+        )
+
+        # Optional product-of-spheres retraction (unit-norm each row)
+        if p_cfg.retract_rows:
+            p_slice.div_(p_slice.norm(dim=-1, keepdim=True).clamp_min_(1e-8))
 
         return p_slice
 
@@ -757,7 +807,8 @@ class NorMuonAndAdam:
     @torch.compile(dynamic=False, fullgraph=True)
     def _cautious_wd_and_update_inplace(p, mantissa, grad, wd_tensor, lr_tensor):
         """
-        Cautious weight decay + parameter update. wd_tensor and lr_tensor are 0-D CPU tensors.
+        Cautious weight decay + parameter update.
+        wd_tensor is a scalar tensor; lr_tensor may be scalar or per-matrix broadcast tensor.
         Mantissa is tracked to enable higher precision updates on bfloat16 parameters.
         bfloat16 format: 1 sign bit + 8 exponent bits + 7 mantissa bits = 16 bits total
         float32 format: 1 sign bit + 8 exponent bits + 23 mantissa bits = 32 bits total
@@ -1431,6 +1482,10 @@ class Hyperparameters:
     # schedule
     num_scheduled_iterations: int = 1515  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    # AutoNorMuon-style NorMuon features
+    normuon_adaptive_lr: bool = os.environ.get("NORMUON_ADAPTIVE_LR", "1") == "1"
+    normuon_gnorm_beta: float = float(os.environ.get("NORMUON_GNORM_BETA", "0.95"))
+    normuon_retract_rows: bool = True  # required: always retract rows to product of spheres
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1584,6 +1639,9 @@ class TrainingManager():
             momentum=0.95,
             beta2=0.95,
             weight_decay=1.2,
+            adaptive_lr=args.normuon_adaptive_lr,
+            gnorm_beta=args.normuon_gnorm_beta,
+            retract_rows=True,
         )
 
         self.optimizer = NorMuonAndAdam(
