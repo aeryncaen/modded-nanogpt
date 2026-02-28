@@ -361,8 +361,7 @@ class ParamConfig:
     chunk_size: int | None = None
     momentum: float | None = None
     gnorm_beta: float | None = None
-    dropout_thresh: float | None = None
-    ratio_exp: float | None = None
+    lambda_reg: float | None = None
     per_matrix_lr_mul: list[float] | None = None
 
 
@@ -532,8 +531,7 @@ class NorMuonAndAdam:
                 chunk_size=chunk_size,
                 momentum=self.normuon_defaults["momentum"],
                 gnorm_beta=self.normuon_defaults["gnorm_beta"],
-                dropout_thresh=self.normuon_defaults["dropout_thresh"],
-                ratio_exp=self.normuon_defaults["ratio_exp"],
+                lambda_reg=self.normuon_defaults["lambda_reg"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
             )
         else:
@@ -561,10 +559,11 @@ class NorMuonAndAdam:
                     chunk_shape, dtype=torch.float32, device=param.device
                 )
 
-                # MagMuon: per-neuron (per-row) gnorm EMA for adaptive LR
+                # MagMuon: per-neuron (per-row) gnorm EMA for adaptive gain
+                # Initialized to -1 (impossible for norms) so first step is detected robustly
                 gnorm_ema_shape = (*chunk_shape[:-1], 1)
-                gnorm_ema = torch.zeros(
-                    gnorm_ema_shape, dtype=torch.float32, device=param.device
+                gnorm_ema = torch.full(
+                    gnorm_ema_shape, -1.0, dtype=torch.float32, device=param.device
                 )
 
                 # Mantissa buffer for precision tracking
@@ -648,7 +647,7 @@ class NorMuonAndAdam:
                 p_state = self.param_states[param]
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
-                p_state["gnorm_ema"].zero_()
+                p_state["gnorm_ema"].fill_(-1.0)
 
     def copy_lm_state_to_embed(self):
         """
@@ -873,22 +872,22 @@ class NorMuonAndAdam:
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
-        # Nesterov momentum (FP32)
+        # Step 1: Nesterov momentum → p̂ (estimate of signal p)
         momentum = self._momentum_t.to(grad_chunk.dtype)
         p_state["momentum_buffer"].lerp_(grad_chunk, 1 - momentum)
         g = grad_chunk.lerp_(p_state["momentum_buffer"], momentum)
 
-        # AOL preconditioning (replaces Polar Express orthogonalization)
-        v_chunk = NorMuonAndAdam._apply_aol_precondition(g)
-
-        # MagMuon: per-neuron signed gnorm deviation for adaptive LR + stagnant dropout
-        v_chunk = NorMuonAndAdam._apply_magmuon_adaptive_lr(
-            v_chunk, p_state["gnorm_ema"], p_cfg.gnorm_beta, p_cfg.dropout_thresh, p_cfg.ratio_exp
-        )
-
-        # Update parameter, in place, with cautious weight decay
+        # Get weight chunk for tangent projection
         param_view = param.data.view(p_cfg.reshape)
         p_slice = param_view[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
+
+        # Steps 2-3: Proj_{T_U} [p − ∂R(u)] in u-space (BEFORE J† pullback)
+        g = NorMuonAndAdam._apply_magmuon_penalty_and_project(
+            g, p_slice, p_state["gnorm_ema"], p_cfg.gnorm_beta, p_cfg.lambda_reg
+        )
+
+        # Step 4: J† pullback — AOL warm start + NS5 refinement
+        v_chunk = NorMuonAndAdam._apply_aol_ns5_precondition(g)
 
         # MLP has per-matrix LR multipliers (c_proj gets 2x LR)
         if p_cfg.per_matrix_lr_mul is not None:
@@ -929,16 +928,24 @@ class NorMuonAndAdam:
 
     @staticmethod
     @torch.compile(dynamic=False, fullgraph=True)
-    def _apply_aol_precondition(g):
-        """AOL diagonal preconditioning from Turbo-Muon. One matmul instead of 5 NS iterations."""
+    def _apply_aol_ns5_precondition(g):
+        """AOL warm start + NS5 refinement for J† approximation."""
         X = g.bfloat16()
         transposed = g.size(-2) > g.size(-1)
         if transposed:
             X = X.mT
 
+        # AOL diagonal preconditioning (warm start for NS5)
         A = X @ X.mT
         s = torch.rsqrt(A.abs().sum(dim=-1, keepdim=True) + 1e-7)
         X = X * s
+
+        # NS5 refinement toward true orthogonal factor (no Frobenius renorm — AOL already scaled)
+        a, b, c = (3.4445, -4.7750, 2.0315)
+        for _ in range(5):
+            A = X @ X.mT
+            B = b * A + c * A @ A
+            X = a * X + B @ X
 
         if transposed:
             X = X.mT
@@ -946,26 +953,39 @@ class NorMuonAndAdam:
 
     @staticmethod
     @torch.compile(dynamic=False, fullgraph=True)
-    def _apply_magmuon_adaptive_lr(v_chunk, gnorm_ema, gnorm_beta, dropout_thresh, ratio_exp):
+    def _apply_magmuon_penalty_and_project(p_hat, weight_chunk, gnorm_ema, gnorm_beta, lambda_reg):
         """
-        MagMuon per-neuron signed gnorm deviation for adaptive LR + stagnant dropout.
+        SI-EDP steps 2-3: Proj_{T_U}(p̂) then adaptive gain within tangent space.
 
-        After orthogonalization, computes per-neuron (per-row) gradient norms,
-        tracks their EMA, and uses signed deviation = (gnorm - ema) / ema:
-          Positive deviation (gnorm rising, struggling) -> shrink update (reduce effective LR).
-          Low absolute deviation (neuron not moving) -> zero out update entirely (hard dropout).
+        Per Prop 6.6: project first, then operate within tangent space T.
+        Step 2: Proj_{T_U}(p̂) — project onto tangent plane of unit sphere per neuron.
+        Step 3: Adaptive gain = (1-λ) + λ·ema/||p_tangent|| — scalar rescaling per neuron.
         """
-        # Per-neuron (per-row) post-ortho gradient norm
-        row_gnorm = v_chunk.float().square().sum(dim=-1, keepdim=True).sqrt()
+        p_float = p_hat.float()
 
-        # Update gnorm EMA and compute adaptive scale
-        gnorm_ema.lerp_(row_gnorm.to(gnorm_ema.dtype), 1 - gnorm_beta)
-        ratio = row_gnorm / gnorm_ema.float().clamp(min=1e-10)
-        scale = (2.0 - ratio.pow(ratio_exp)).clamp(min=0.0)
-        # Stagnant dropout: |ratio - 1| < thresh -> zero update
-        scale = scale * ((ratio - 1.0).abs() >= dropout_thresh)
+        # Step 2: Proj_{T_U}(p̂) — project to tangent plane FIRST
+        w_float = weight_chunk.float().reshape(weight_chunk.size(0), -1)
+        w_norms = w_float.square().sum(dim=-1, keepdim=True).sqrt().clamp(min=1e-10)
+        radial = w_float / w_norms
+        p_flat = p_float.reshape(p_float.size(0), -1)
+        p_radial = (p_flat * radial).sum(dim=-1, keepdim=True)
+        p_tangent = p_flat - p_radial * radial
 
-        return v_chunk.mul_(scale.to(v_chunk.dtype))
+        # Step 3: Adaptive gain within tangent space
+        tangent_gnorm = p_tangent.square().sum(dim=-1, keepdim=True).sqrt()
+
+        # Branchless cold-start: gnorm_ema initialized to -1 (impossible for norms)
+        # lerp weight = 1.0 on first step (full init), (1-beta) after
+        needs_init = (gnorm_ema.min() < 0).to(tangent_gnorm.dtype)
+        blend = needs_init + (1 - needs_init) * (1 - gnorm_beta)
+        gnorm_ema.lerp_(tangent_gnorm.to(gnorm_ema.dtype), blend)
+
+        # Scalar gain: (1-λ) + λ·ema/||p_tangent||
+        # Shrinks large tangent gradients, boosts small ones toward EMA
+        gain = (1 - lambda_reg) + lambda_reg * gnorm_ema.float() / tangent_gnorm.clamp(min=1e-10)
+        v = p_tangent * gain
+
+        return v.reshape(p_hat.shape).to(p_hat.dtype)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -1782,8 +1802,7 @@ class TrainingManager():
             lr=0.023,
             momentum=0.95,
             gnorm_beta=0.99,
-            dropout_thresh=0.05,
-            ratio_exp=1.0,
+            lambda_reg=1.0,
             weight_decay=1.2,
         )
 
