@@ -940,16 +940,17 @@ class NorMuonAndAdam:
         # Per-neuron (per-row) post-ortho gradient norm
         row_gnorm = v_chunk.float().square().sum(dim=-1, keepdim=True).sqrt()
 
-        # Update gnorm EMA and compute scale in minimal ops
+        # Update gnorm EMA and compute adaptive scale
         gnorm_ema.lerp_(row_gnorm.to(gnorm_ema.dtype), 1 - gnorm_beta)
-        # deviation = (gnorm - ema) / ema; scale = clamp(1 - deviation, 0)
-        # Algebraically: scale = clamp(2 - gnorm/ema, 0)
         ratio = row_gnorm / gnorm_ema.float().clamp(min=1e-10)
         scale = (2.0 - ratio.pow(ratio_exp)).clamp(min=0.0)
         # Stagnant dropout: |ratio - 1| < thresh -> zero update
         scale = scale * ((ratio - 1.0).abs() >= dropout_thresh)
 
-        return v_chunk.mul_(scale.to(v_chunk.dtype))
+        # Norm restoration from per-row norms (no extra full-tensor reads)
+        vnorm = row_gnorm.square().sum(dim=(-2, -1), keepdim=True).sqrt()
+        vnorm_new = (row_gnorm * scale).square().sum(dim=(-2, -1), keepdim=True).sqrt()
+        return v_chunk.mul_((scale * (vnorm / vnorm_new.clamp(min=1e-10))).to(v_chunk.dtype))
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
