@@ -356,11 +356,12 @@ class ParamConfig:
     weight_decay: float
     # Adam-specific
     eps: float | None = None
-    # NorMuon-specific
+    # NorMuon/MagMuon-specific
     reshape: tuple | None = None
     chunk_size: int | None = None
     momentum: float | None = None
-    beta2: float | None = None
+    gnorm_beta: float | None = None
+    dropout_thresh: float | None = None
     per_matrix_lr_mul: list[float] | None = None
 
 
@@ -383,7 +384,9 @@ class NorMuonAndAdam:
 
     Differences from standard Muon:
     - Newton-Shulz is replaced with Polar Express for the orthogonalization step
-    - NorMuon adds a low-rank variance estimator similar to Adafactor. https://arxiv.org/pdf/2510.05491
+    - MagMuon replaces NorMuon's Adafactor-style variance reduction with per-neuron
+      signed gnorm deviation: positive deviation (struggling) -> reduce LR,
+      low absolute deviation (stagnant) -> hard dropout (zero update)
     - Cautious weight decay, a gated version of decoupled weight decay
     - Mantissa tracking for precision
 
@@ -527,7 +530,8 @@ class NorMuonAndAdam:
                 reshape=reshape,
                 chunk_size=chunk_size,
                 momentum=self.normuon_defaults["momentum"],
-                beta2=self.normuon_defaults["beta2"],
+                gnorm_beta=self.normuon_defaults["gnorm_beta"],
+                dropout_thresh=self.normuon_defaults["dropout_thresh"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
             )
         else:
@@ -555,13 +559,10 @@ class NorMuonAndAdam:
                     chunk_shape, dtype=torch.float32, device=param.device
                 )
 
-                # Second momentum buffer - reduced along one dimension
-                if chunk_shape[-2] >= chunk_shape[-1]:
-                    second_mom_shape = (*chunk_shape[:-1], 1)
-                else:
-                    second_mom_shape = (*chunk_shape[:-2], 1, chunk_shape[-1])
-                second_momentum_buffer = torch.zeros(
-                    second_mom_shape, dtype=torch.float32, device=param.device
+                # MagMuon: per-neuron (per-row) gnorm EMA for adaptive LR
+                gnorm_ema_shape = (*chunk_shape[:-1], 1)
+                gnorm_ema = torch.zeros(
+                    gnorm_ema_shape, dtype=torch.float32, device=param.device
                 )
 
                 # Mantissa buffer for precision tracking
@@ -571,7 +572,7 @@ class NorMuonAndAdam:
 
                 self.param_states[param] = dict(
                     momentum_buffer=momentum_buffer,
-                    second_momentum_buffer=second_momentum_buffer,
+                    gnorm_ema=gnorm_ema,
                     mantissa=mantissa,
                 )
 
@@ -645,7 +646,7 @@ class NorMuonAndAdam:
                 p_state = self.param_states[param]
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
-                p_state["second_momentum_buffer"].zero_()
+                p_state["gnorm_ema"].zero_()
 
     def copy_lm_state_to_embed(self):
         """
@@ -877,10 +878,9 @@ class NorMuonAndAdam:
             split_baddbmm=is_large_matrix,
         )
 
-        # Variance reduction
-        red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
-        v_chunk = NorMuonAndAdam._apply_normuon_variance_reduction(
-            v_chunk, p_state["second_momentum_buffer"], p_cfg.beta2, red_dim
+        # MagMuon: per-neuron signed gnorm deviation for adaptive LR + stagnant dropout
+        v_chunk = NorMuonAndAdam._apply_magmuon_adaptive_lr(
+            v_chunk, p_state["gnorm_ema"], p_cfg.gnorm_beta, p_cfg.dropout_thresh
         )
 
         # Update parameter, in place, with cautious weight decay
@@ -926,18 +926,33 @@ class NorMuonAndAdam:
 
     @staticmethod
     @torch.compile(dynamic=False, fullgraph=True)
-    def _apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red_dim):
-        """NorMuon variance reduction. Algebraically fuses the normalization steps to minimize memory ops."""
-        v_mean = v_chunk.float().square().mean(dim=red_dim, keepdim=True)
-        red_dim_size = v_chunk.size(red_dim)
-        v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True).mul_(red_dim_size)
-        v_norm = v_norm_sq.sqrt_()
-        second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-        step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt_()
-        scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-        v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
-        final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
-        return v_chunk.mul_(final_scale.type_as(v_chunk))
+    def _apply_magmuon_adaptive_lr(v_chunk, gnorm_ema, gnorm_beta, dropout_thresh):
+        """
+        MagMuon per-neuron signed gnorm deviation for adaptive LR + stagnant dropout.
+
+        After orthogonalization, computes per-neuron (per-row) gradient norms,
+        tracks their EMA, and uses signed deviation = (gnorm - ema) / ema:
+          Positive deviation (gnorm rising, struggling) -> shrink update (reduce effective LR).
+          Low absolute deviation (neuron not moving) -> zero out update entirely (hard dropout).
+        """
+        # Per-neuron (per-row) post-ortho gradient norm
+        row_gnorm = v_chunk.float().square().sum(dim=-1, keepdim=True).sqrt()
+
+        # Update gnorm EMA
+        gnorm_ema.lerp_(row_gnorm.to(gnorm_ema.dtype), 1 - gnorm_beta)
+
+        # Signed deviation: (current - trend) / trend
+        ema_f = gnorm_ema.float().clamp(min=1e-10)
+        deviation = (row_gnorm - ema_f) / ema_f
+
+        # Positive deviation -> scale down (noisy/struggling neuron)
+        pos_dev = deviation.clamp(min=0.0)
+        lr_mult = (1.0 - pos_dev).clamp(min=0.0)
+
+        # Low absolute deviation -> dropout (stagnant neuron)
+        dropout_mask = (deviation.abs() >= dropout_thresh).to(v_chunk.dtype)
+
+        return v_chunk.mul_((lr_mult * dropout_mask).to(v_chunk.dtype))
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -1753,7 +1768,8 @@ class TrainingManager():
         normuon_defaults = dict(
             lr=0.023,
             momentum=0.95,
-            beta2=0.95,
+            gnorm_beta=0.99,
+            dropout_thresh=0.05,
             weight_decay=1.2,
         )
 
