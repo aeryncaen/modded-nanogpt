@@ -362,6 +362,7 @@ class ParamConfig:
     momentum: float | None = None
     gnorm_beta: float | None = None
     dropout_thresh: float | None = None
+    ratio_exp: float | None = None
     per_matrix_lr_mul: list[float] | None = None
 
 
@@ -532,6 +533,7 @@ class NorMuonAndAdam:
                 momentum=self.normuon_defaults["momentum"],
                 gnorm_beta=self.normuon_defaults["gnorm_beta"],
                 dropout_thresh=self.normuon_defaults["dropout_thresh"],
+                ratio_exp=self.normuon_defaults["ratio_exp"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
             )
         else:
@@ -880,7 +882,7 @@ class NorMuonAndAdam:
 
         # MagMuon: per-neuron signed gnorm deviation for adaptive LR + stagnant dropout
         v_chunk = NorMuonAndAdam._apply_magmuon_adaptive_lr(
-            v_chunk, p_state["gnorm_ema"], p_cfg.gnorm_beta, p_cfg.dropout_thresh
+            v_chunk, p_state["gnorm_ema"], p_cfg.gnorm_beta, p_cfg.dropout_thresh, p_cfg.ratio_exp
         )
 
         # Update parameter, in place, with cautious weight decay
@@ -926,7 +928,7 @@ class NorMuonAndAdam:
 
     @staticmethod
     @torch.compile(dynamic=False, fullgraph=True)
-    def _apply_magmuon_adaptive_lr(v_chunk, gnorm_ema, gnorm_beta, dropout_thresh):
+    def _apply_magmuon_adaptive_lr(v_chunk, gnorm_ema, gnorm_beta, dropout_thresh, ratio_exp):
         """
         MagMuon per-neuron signed gnorm deviation for adaptive LR + stagnant dropout.
 
@@ -943,7 +945,7 @@ class NorMuonAndAdam:
         # deviation = (gnorm - ema) / ema; scale = clamp(1 - deviation, 0)
         # Algebraically: scale = clamp(2 - gnorm/ema, 0)
         ratio = row_gnorm / gnorm_ema.float().clamp(min=1e-10)
-        scale = (2.0 - ratio).clamp(min=0.0)
+        scale = (2.0 - ratio.pow(ratio_exp)).clamp(min=0.0)
         # Stagnant dropout: |ratio - 1| < thresh -> zero update
         scale = scale * ((ratio - 1.0).abs() >= dropout_thresh)
 
@@ -1765,6 +1767,7 @@ class TrainingManager():
             momentum=0.95,
             gnorm_beta=0.99,
             dropout_thresh=0.05,
+            ratio_exp=1.0,
             weight_decay=1.2,
         )
 
