@@ -965,10 +965,7 @@ class NorMuonAndAdam:
         # Stagnant dropout: |ratio - 1| < thresh -> zero update
         scale = scale * ((ratio - 1.0).abs() >= dropout_thresh)
 
-        # Norm restoration from per-row norms (no extra full-tensor reads)
-        vnorm = row_gnorm.square().sum(dim=(-2, -1), keepdim=True).sqrt()
-        vnorm_new = (row_gnorm * scale).square().sum(dim=(-2, -1), keepdim=True).sqrt()
-        return v_chunk.mul_((scale * (vnorm / vnorm_new.clamp(min=1e-10))).to(v_chunk.dtype))
+        return v_chunk.mul_(scale.to(v_chunk.dtype))
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
