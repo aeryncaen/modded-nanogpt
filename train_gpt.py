@@ -945,9 +945,8 @@ class NorMuonAndAdam:
         ema_f = gnorm_ema.float().clamp(min=1e-10)
         deviation = (row_gnorm - ema_f) / ema_f
 
-        # Positive deviation -> scale down (noisy/struggling neuron)
-        pos_dev = deviation.clamp(min=0.0)
-        lr_mult = (1.0 - pos_dev).clamp(min=0.0)
+        # Signed adaptive LR: below trend -> boost, above trend -> reduce
+        lr_mult = (1.0 - deviation).clamp(min=0.0)
 
         # Low absolute deviation -> dropout (stagnant neuron)
         dropout_mask = (deviation.abs() >= dropout_thresh).to(v_chunk.dtype)
