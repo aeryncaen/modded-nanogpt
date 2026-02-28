@@ -964,14 +964,15 @@ class NorMuonAndAdam:
         p_float = p_hat.float()
 
         # Step 2: Proj_{T_U}(p̂) — project to tangent plane FIRST
-        w_float = weight_chunk.float().reshape(weight_chunk.size(0), -1)
+        # Work on dim=-1 directly to preserve shape for 2D and 3D chunks
+        w_float = weight_chunk.float()
         w_norms = w_float.square().sum(dim=-1, keepdim=True).sqrt().clamp(min=1e-10)
         radial = w_float / w_norms
-        p_flat = p_float.reshape(p_float.size(0), -1)
-        p_radial = (p_flat * radial).sum(dim=-1, keepdim=True)
-        p_tangent = p_flat - p_radial * radial
+        p_radial = (p_float * radial).sum(dim=-1, keepdim=True)
+        p_tangent = p_float - p_radial * radial
 
         # Step 3: Adaptive gain within tangent space
+        # tangent_gnorm shape matches gnorm_ema: (*chunk_shape[:-1], 1)
         tangent_gnorm = p_tangent.square().sum(dim=-1, keepdim=True).sqrt()
 
         # Branchless cold-start: gnorm_ema initialized to -1 (impossible for norms)
@@ -985,7 +986,7 @@ class NorMuonAndAdam:
         gain = (1 - lambda_reg) + lambda_reg * gnorm_ema.float() / tangent_gnorm.clamp(min=1e-10)
         v = p_tangent * gain
 
-        return v.reshape(p_hat.shape).to(p_hat.dtype)
+        return v.to(p_hat.dtype)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
