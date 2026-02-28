@@ -873,12 +873,13 @@ class NorMuonAndAdam:
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
-        # Fused Nesterov momentum + Polar Express orthogonalization
-        is_large_matrix = chunk_shape[-2] > 1024
-        v_chunk = polar_express(
-            grad_chunk, p_state["momentum_buffer"], self._momentum_t,
-            split_baddbmm=is_large_matrix,
-        )
+        # Nesterov momentum (FP32)
+        momentum = self._momentum_t.to(grad_chunk.dtype)
+        p_state["momentum_buffer"].lerp_(grad_chunk, 1 - momentum)
+        g = grad_chunk.lerp_(p_state["momentum_buffer"], momentum)
+
+        # AOL preconditioning (replaces Polar Express orthogonalization)
+        v_chunk = NorMuonAndAdam._apply_aol_precondition(g)
 
         # MagMuon: per-neuron signed gnorm deviation for adaptive LR + stagnant dropout
         v_chunk = NorMuonAndAdam._apply_magmuon_adaptive_lr(
@@ -925,6 +926,23 @@ class NorMuonAndAdam:
         p_precise.copy_(p_precise - (p_precise * mask * wd_factor * lr_factor) - (grad * lr_factor))
         p.copy_((p_precise_raw >> 16).to(torch.uint16))
         mantissa.copy_(p_precise_raw.to(torch.uint16))
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _apply_aol_precondition(g):
+        """AOL diagonal preconditioning from Turbo-Muon. One matmul instead of 5 NS iterations."""
+        X = g.bfloat16()
+        transposed = g.size(-2) > g.size(-1)
+        if transposed:
+            X = X.mT
+
+        A = X @ X.mT
+        s = torch.rsqrt(A.abs().sum(dim=-1, keepdim=True) + 1e-7)
+        X = X * s
+
+        if transposed:
+            X = X.mT
+        return X
 
     @staticmethod
     @torch.compile(dynamic=False, fullgraph=True)
